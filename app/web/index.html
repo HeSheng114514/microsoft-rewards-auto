@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Microsoft Rewards 自动签到</title>
+<link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+<div id="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">R</div>
+      <div>
+        <div class="brand-name">Rewards 自动签到</div>
+        <div class="brand-sub" id="brandSub">本地运行中</div>
+      </div>
+    </div>
+
+    <div class="account-picker">
+      <label>当前账号</label>
+      <select id="accountSelect"></select>
+      <div class="account-meta" id="accountMeta">—</div>
+    </div>
+
+    <nav>
+      <button class="nav-btn active" data-view="dashboard"><span>📊</span>总览</button>
+      <button class="nav-btn" data-view="accounts"><span>👥</span>账号管理</button>
+      <button class="nav-btn" data-view="settings"><span>⚙️</span>设置</button>
+      <button class="nav-btn" data-view="history"><span>🗂️</span>历史记录</button>
+      <button class="nav-btn" data-view="logs"><span>📜</span>运行日志</button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="dot" id="connDot"></div>
+      <span id="connText">连接中…</span>
+    </div>
+  </aside>
+
+  <main class="main">
+    <!-- ============ 总览 ============ -->
+    <section class="view active" id="view-dashboard">
+      <header class="page-head">
+        <h1>总览 <span class="head-account" id="headAccount"></span></h1>
+        <div class="actions">
+          <button class="btn primary" id="btnRun">本账号执行</button>
+          <button class="btn" id="btnRunAll">全部账号执行</button>
+          <button class="btn" id="btnCancel" hidden>停止</button>
+          <button class="btn" id="btnLogin">登录本账号</button>
+          <button class="btn ghost" id="btnRefresh">刷新账户</button>
+        </div>
+      </header>
+
+      <div class="cards">
+        <div class="card stat">
+          <div class="stat-label">可用积分</div>
+          <div class="stat-value" id="stPoints">—</div>
+          <div class="stat-hint" id="stLevel">—</div>
+        </div>
+        <div class="card stat">
+          <div class="stat-label">今日获得</div>
+          <div class="stat-value accent" id="stTodayGain">—</div>
+          <div class="stat-hint" id="stTodayRuns">今日自动执行 0 次</div>
+        </div>
+        <div class="card stat">
+          <div class="stat-label">下次自动执行</div>
+          <div class="stat-value small" id="stNext">—</div>
+          <div class="stat-hint" id="stNextHint">—</div>
+        </div>
+        <div class="card stat">
+          <div class="stat-label">累计执行 / 累计积分</div>
+          <div class="stat-value small" id="stTotals">—</div>
+          <div class="stat-hint" id="stAccount">—</div>
+        </div>
+      </div>
+
+      <div class="grid2">
+        <div class="card">
+          <div class="card-head"><h2>执行状态</h2></div>
+          <div class="run-status" id="runStatus">
+            <div class="badge idle" id="runBadge">空闲</div>
+            <div class="run-detail" id="runDetail">尚未执行过，点击「本账号执行」开始。</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>今日额度</h2></div>
+          <div id="quotaList" class="quota-list"><div class="muted">暂无数据，执行一次后显示。</div></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>任务清单</h2><span class="card-hint" id="taskSummary"></span></div>
+        <div id="taskList" class="list"><div class="muted">执行一次后显示本次发现的任务与处理结果。</div></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>全部账号</h2><button class="btn ghost sm" id="btnGoAccounts">管理账号</button></div>
+        <div id="accountOverview" class="list"><div class="muted">暂无账号</div></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>最近执行</h2><button class="btn ghost sm" id="btnGoHistory">查看全部</button></div>
+        <div id="recentList" class="list"><div class="muted">暂无记录</div></div>
+      </div>
+    </section>
+
+    <!-- ============ 账号管理 ============ -->
+    <section class="view" id="view-accounts">
+      <header class="page-head">
+        <h1>账号管理</h1>
+        <div class="actions">
+          <button class="btn primary" id="btnAddAccount">+ 添加账号</button>
+        </div>
+      </header>
+
+      <div class="card tip-card">
+        <p><strong>每个账号使用完全独立的浏览器配置目录</strong>，登录态互不影响，运行历史与统计也各自独立。</p>
+        <p>添加账号后，请点击该账号的「登录」按钮，在弹出的浏览器窗口中登录对应的 Microsoft 账号（只需一次）。</p>
+      </div>
+
+      <div id="accountCards" class="account-cards"></div>
+    </section>
+
+    <!-- ============ 设置 ============ -->
+    <section class="view" id="view-settings">
+      <header class="page-head">
+        <h1>设置</h1>
+        <div class="actions">
+          <select id="scopeSelect" class="scope-select">
+            <option value="account">仅当前账号</option>
+            <option value="global">全局默认（所有账号）</option>
+          </select>
+          <button class="btn primary" id="btnSave">保存设置</button>
+          <button class="btn ghost" id="btnReset">恢复默认</button>
+        </div>
+      </header>
+      <div class="dirty-hint" id="dirtyHint" hidden>
+        <span>✏️ 你有未保存的修改。自动刷新已暂停，改完请点「保存设置」（或按 Ctrl+S）。</span>
+        <button class="btn sm ghost" id="btnDiscard">放弃修改</button>
+      </div>
+      <div class="card tip-card" id="scopeTip"></div>
+
+      <div class="card">
+        <div class="card-head"><h2>定时执行</h2><label class="switch"><input type="checkbox" id="sched_enabled" /><span></span>启用</label></div>
+        <div class="form-row">
+          <label>调度模式</label>
+          <select id="sched_mode">
+            <option value="daily">每天固定时刻</option>
+            <option value="interval">每隔一段时间</option>
+          </select>
+          <div class="tip">定时计划为全局设置，对所有启用的账号生效（账号可单独关闭）。</div>
+        </div>
+        <div class="form-row" data-mode="daily">
+          <label>执行时刻</label>
+          <div class="inline-list" id="timesList"></div>
+          <button class="btn ghost sm" id="btnAddTime">+ 添加时刻</button>
+          <div class="tip">可添加多个时刻，例如 09:10 与 20:30。多账号会依次错峰执行。</div>
+        </div>
+        <div class="form-row" data-mode="interval">
+          <label>间隔（分钟）</label>
+          <input type="number" id="sched_interval" min="5" step="5" />
+        </div>
+        <div class="form-row">
+          <label>每账号每天最多执行</label>
+          <input type="number" id="sched_max" min="1" max="24" />
+          <span class="unit">次</span>
+          <div class="tip">防止重复刷取。手动执行不计入此上限。</div>
+        </div>
+        <div class="form-row">
+          <label>账号间错峰间隔</label>
+          <input type="number" id="sched_stagger" min="20" max="1800" step="10" />
+          <span class="unit">秒</span>
+          <div class="tip">多个账号同时到点时，依次间隔这么久启动，避免同时打开多个浏览器。</div>
+        </div>
+        <div class="form-row checks">
+          <label class="switch"><input type="checkbox" id="sched_catchup" /><span></span>错过时刻自动补跑</label>
+          <label class="switch"><input type="checkbox" id="sched_runOnStart" /><span></span>软件启动后立即补跑一次</label>
+          <label class="switch"><input type="checkbox" id="sched_skipWeekends" /><span></span>周末不执行</label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>搜索设置</h2></div>
+        <div class="form-row checks">
+          <label class="switch"><input type="checkbox" id="search_enabled" /><span></span>启用自动搜索</label>
+          <label class="switch"><input type="checkbox" id="search_autoFill" /><span></span>自动刷满（积分不再增长即停止）</label>
+          <label class="switch"><input type="checkbox" id="search_mobileMode" /><span></span>移动端模式（手机 UA 搜索）</label>
+        </div>
+        <div class="form-row">
+          <label>单次最大搜索次数</label>
+          <input type="number" id="search_max" min="1" max="200" />
+          <div class="tip">安全上限。开启「自动刷满」后，通常会在积分不再增加时提前停止。</div>
+        </div>
+        <div class="form-row">
+          <label>搜索间隔（秒）</label>
+          <input type="number" id="search_minDelay" min="1" max="120" class="tiny" />
+          <span class="unit">—</span>
+          <input type="number" id="search_maxDelay" min="1" max="180" class="tiny" />
+          <div class="tip">随机间隔，模拟真人节奏，建议 3–8 秒。</div>
+        </div>
+        <div class="form-row">
+          <label>连续未涨分则停止</label>
+          <input type="number" id="search_stopNoGain" min="1" max="10" />
+          <span class="unit">次</span>
+        </div>
+        <div class="form-row">
+          <label>搜索词来源</label>
+          <select id="search_querySource">
+            <option value="mixed">混合（内置词库，推荐）</option>
+            <option value="news">必应热榜话题</option>
+            <option value="custom">自定义词库</option>
+          </select>
+          <div class="tip">自定义词库：<code>data/accounts/&lt;账号id&gt;/queries.txt</code>，每行一个关键词。</div>
+        </div>
+        <div class="form-row checks">
+          <label class="switch"><input type="checkbox" id="search_verify" /><span></span>搜索后校验积分增长</label>
+          <label class="switch"><input type="checkbox" id="search_readNews" /><span></span>搜索前浏览热榜</label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>任务设置</h2></div>
+        <div class="form-row checks">
+          <label class="switch"><input type="checkbox" id="tasks_enabled" /><span></span>启用任务处理</label>
+          <label class="switch"><input type="checkbox" id="tasks_dailySet" /><span></span>完成每日活动任务</label>
+          <label class="switch"><input type="checkbox" id="tasks_claim" /><span></span>自动领取可领取积分</label>
+          <label class="switch"><input type="checkbox" id="tasks_visitEarn" /><span></span>刷新积分赚取页</label>
+          <label class="switch"><input type="checkbox" id="tasks_mobile" /><span></span>检测移动应用签到</label>
+          <label class="switch"><input type="checkbox" id="tasks_quizzes" /><span></span>尝试每日测验（实验性）</label>
+        </div>
+        <div class="tip" style="margin-left:0">
+          移动应用签到只能在手机「必应」App 内完成，网页端没有对应接口。开启后本工具会在每次运行时
+          <strong>准确检测并提示</strong>该任务状态（不会假装完成）。
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>浏览器</h2></div>
+        <div class="form-row">
+          <label>浏览器</label>
+          <select id="browser_kind">
+            <option value="msedge">Microsoft Edge（推荐）</option>
+            <option value="chrome">Google Chrome</option>
+            <option value="chromium">Playwright Chromium</option>
+          </select>
+          <div class="tip" id="browserTip"></div>
+        </div>
+        <div class="form-row checks">
+          <label class="switch"><input type="checkbox" id="browser_headless" /><span></span>后台无窗口运行（推荐）</label>
+          <label class="switch"><input type="checkbox" id="advanced_keepOpen" /><span></span>执行结束后保留浏览器窗口</label>
+          <label class="switch"><input type="checkbox" id="advanced_screenshot" /><span></span>失败时保存截图</label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>系统托盘与开机自启</h2></div>
+        <div class="form-row checks">
+          <label class="switch"><input type="checkbox" id="tray_enabled" /><span></span>最小化到系统托盘常驻</label>
+          <label class="switch"><input type="checkbox" id="tray_autostart" /><span></span>开机自动启动</label>
+        </div>
+        <div class="tip">开启托盘后，关闭控制台页面软件仍会在后台按计划执行。</div>
+      </div>
+    </section>
+
+    <!-- ============ 历史 ============ -->
+    <section class="view" id="view-history">
+      <header class="page-head">
+        <h1>历史记录 <span class="head-account" id="historyAccount"></span></h1>
+        <div class="actions"><label class="switch"><input type="checkbox" id="historyAll" /><span></span>显示全部账号</label></div>
+      </header>
+      <div class="card"><div id="historyList" class="list"><div class="muted">暂无记录</div></div></div>
+    </section>
+
+    <!-- ============ 日志 ============ -->
+    <section class="view" id="view-logs">
+      <header class="page-head">
+        <h1>运行日志</h1>
+        <div class="actions">
+          <label class="switch"><input type="checkbox" id="autoScroll" checked /><span></span>自动滚动</label>
+          <button class="btn ghost" id="btnClearLogs">清空</button>
+        </div>
+      </header>
+      <div class="card log-card"><pre id="logBox" class="log-box"></pre></div>
+    </section>
+  </main>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>
