@@ -1,0 +1,34 @@
+{
+  "name": "microsoft-rewards-auto",
+  "version": "1.0.0",
+  "private": false,
+  "description": "Microsoft Rewards 每日自动搜索与任务执行工具（本地控制台 + 定时调度 + 系统托盘，支持多账号）",
+  "license": "GPL-3.0",
+  "author": "HeSheng114514",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HeSheng114514/microsoft-rewards-auto.git"
+  },
+  "keywords": [
+    "microsoft-rewards",
+    "automation",
+    "playwright",
+    "edge",
+    "rewards",
+    "multi-account"
+  ],
+  "type": "module",
+  "main": "app/main.js",
+  "scripts": {
+    "start": "node app/main.js",
+    "once": "node app/main.js --once",
+    "login": "node app/main.js --login",
+    "tray": "node app/main.js --tray",
+    "install-tray": "node app/main.js --install-tray",
+    "uninstall-tray": "node app/main.js --uninstall-tray"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "playwright-core": "^1.63.0"
+  }
+}

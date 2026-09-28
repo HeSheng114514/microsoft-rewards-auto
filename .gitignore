@@ -1,0 +1,53 @@
+# ============================================================
+#  敏感 / 运行时数据 —— 绝对不要提交
+# ============================================================
+
+# 浏览器登录态（含账号 Cookie，泄露等于交出账号）
+data/accounts/*/browser-profile/
+
+# 账号配置与运行数据（含账号名、积分、历史）
+data/settings.json
+data/state.json
+data/app.lock
+data/tray.pid
+data/.booting
+data/accounts/*/state.json
+data/accounts/*/screenshots/
+data/accounts/*/queries.txt
+
+# 日志（可能包含账号名与页面内容）
+data/logs/
+*.log
+
+# 旧版单账号配置（可能含个人设置）
+config.json
+config.json.migrated
+
+# 更新日志（按要求不上传到 GitHub）
+GitHub更新日志
+GitHub更新日志.*
+
+# ============================================================
+#  依赖与构建产物
+# ============================================================
+node_modules/
+package-lock.json
+dist/
+build/
+*.zip
+
+# ============================================================
+#  编辑器 / 系统
+# ============================================================
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 临时调试产物
+probe*.mjs
+probe*.json
+tools/
+tools-dev/
