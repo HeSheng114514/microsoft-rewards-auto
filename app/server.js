@@ -13,7 +13,7 @@ import {
 import { loadState, saveState, todayKey, dropStateCache } from './store.js';
 import { log, subscribe, recentLogs } from './logger.js';
 import { runOnce, isRunning, cancelRun, currentRunningAccount } from './runner.js';
-import { startScheduler, stopScheduler, schedulerStatus, refreshNextRun, computeNextRun } from './scheduler.js';
+import { startScheduler, stopScheduler, schedulerStatus, refreshNextRun, computeNextRun, checkNow } from './scheduler.js';
 import { listBrowsers, guideLogin, closeBrowser, isBrowserOpen, signOut } from './browser.js';
 import { inspect } from './rewards.js';
 import { launchBrowser, getPage } from './browser.js';
@@ -279,6 +279,14 @@ export function createServer() {
       if (p === '/api/cancel' && req.method === 'POST') {
         const ok = cancelRun();
         return json(res, 200, { ok, message: ok ? '已请求取消' : '当前没有正在执行的任务' });
+      }
+
+      /* ---------------- 立即检查计划（补跑错过时刻） ---------------- */
+      if (p === '/api/check-now' && req.method === 'POST') {
+        if (isRunning()) return json(res, 200, { ok: false, error: '已有任务正在执行' });
+        log.info('手动触发计划检查…');
+        checkNow().catch((e) => log.error('计划检查失败：' + e.message));
+        return json(res, 200, { ok: true, message: '已开始检查计划，若有错过的时刻会立即补跑' });
       }
 
       /* ---------------- 登录 ---------------- */

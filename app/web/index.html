@@ -44,11 +44,14 @@
         <div class="actions">
           <button class="btn primary" id="btnRun">本账号执行</button>
           <button class="btn" id="btnRunAll">全部账号执行</button>
+          <button class="btn" id="btnCheckNow" title="按计划检查：若有错过的执行时刻，立即为每个账号补跑">立即检查计划</button>
           <button class="btn" id="btnCancel" hidden>停止</button>
           <button class="btn" id="btnLogin">登录本账号</button>
           <button class="btn ghost" id="btnRefresh">刷新账户</button>
         </div>
       </header>
+
+      <div class="dirty-hint" id="schedWarn" hidden></div>
 
       <div class="cards">
         <div class="card stat">
@@ -171,9 +174,15 @@
           <span class="unit">秒</span>
           <div class="tip">多个账号同时到点时，依次间隔这么久启动，避免同时打开多个浏览器。</div>
         </div>
+        <div class="form-row">
+          <label>补跑窗口</label>
+          <input type="number" id="sched_catchupHours" min="1" max="24" />
+          <span class="unit">小时</span>
+          <div class="tip">错过计划时刻后，在这个时长内打开软件仍会自动补跑。例如计划 03:00、窗口 12 小时，则 15:00 前开机都会补跑；再晚就等第二天。</div>
+        </div>
         <div class="form-row checks">
           <label class="switch"><input type="checkbox" id="sched_catchup" /><span></span>错过时刻自动补跑</label>
-          <label class="switch"><input type="checkbox" id="sched_runOnStart" /><span></span>软件启动后立即补跑一次</label>
+          <label class="switch"><input type="checkbox" id="sched_runOnStart" /><span></span>软件启动后立即检查计划</label>
           <label class="switch"><input type="checkbox" id="sched_skipWeekends" /><span></span>周末不执行</label>
         </div>
       </div>
@@ -222,6 +231,7 @@
         <div class="form-row checks">
           <label class="switch"><input type="checkbox" id="tasks_enabled" /><span></span>启用任务处理</label>
           <label class="switch"><input type="checkbox" id="tasks_dailySet" /><span></span>完成每日活动任务</label>
+          <label class="switch"><input type="checkbox" id="tasks_quests" /><span></span>完成拼图任务（赚取页）</label>
           <label class="switch"><input type="checkbox" id="tasks_claim" /><span></span>自动领取可领取积分</label>
           <label class="switch"><input type="checkbox" id="tasks_visitEarn" /><span></span>刷新积分赚取页</label>
           <label class="switch"><input type="checkbox" id="tasks_mobile" /><span></span>检测移动应用签到</label>

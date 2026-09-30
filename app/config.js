@@ -26,8 +26,9 @@ export const DEFAULT_APPLICATION = {
     mode: 'daily',              // daily=每天固定时刻 | interval=每隔 N 分钟
     dailyTimes: ['09:10'],      // mode=daily 时的执行时刻，支持多个
     intervalMinutes: 240,       // mode=interval 时的间隔
-    runOnStart: false,          // 软件启动后是否立即补跑
-    catchUp: true,              // 当天错过计划时刻是否补跑
+    runOnStart: false,          // 软件启动后忽略计划时刻，强制补跑一次（catchUp 已能覆盖大多数场景）
+    catchUp: true,              // 错过计划时刻是否在窗口内补跑（**强烈建议保持开启**）
+    catchUpHours: 12,           // 补跑窗口（小时）。超过这个时长就不再补跑，避免深夜任务被白天无意义地补
     maxRunsPerDay: 2,           // 每个账号每天最多自动执行次数
     skipWeekends: false,
     staggerSeconds: 90,         // 多账号之间的错峰启动间隔（秒）
@@ -56,6 +57,7 @@ export const DEFAULT_APPLICATION = {
   tasks: {
     enabled: true,
     doDailySet: true,           // 完成「每日活动」里的搜索类任务
+    doQuests: true,             // 完成积分赚取页的「拼图任务」（punchcard）
     claimPoints: true,          // 自动领取「可领取」积分
     visitEarnPage: true,        // 访问积分赚取页
     doQuizzes: false,           // 尝试每日测验（实验性）
@@ -73,7 +75,7 @@ export const DEFAULT_APPLICATION = {
 
 export const DEFAULT_ACCOUNT_OVERRIDES = {
   search: { enabled: true, maxSearches: 40, mobileMode: false, querySource: 'mixed', customQueries: [] },
-  tasks: { enabled: true, doDailySet: true, claimPoints: true, visitEarnPage: true, doQuizzes: false, checkMobileApp: true },
+  tasks: { enabled: true, doDailySet: true, doQuests: true, claimPoints: true, visitEarnPage: true, doQuizzes: false, checkMobileApp: true },
   browser: { kind: 'msedge', headless: true, executablePath: '' },
 };
 

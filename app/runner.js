@@ -8,7 +8,7 @@ import {
 import { launchBrowser, closeBrowser, getPage, readAccountName, screenshot } from './browser.js';
 import { inspect, analyzeQuota, bingPoints, homeValueMismatch, DASHBOARD } from './rewards.js';
 import { runSearches } from './search.js';
-import { doAllDashboardTasks, doQuizzes, claimPoints, visitEarn, checkMobileApp } from './tasks.js';
+import { doAllDashboardTasks, doQuests, doQuizzes, claimPoints, visitEarn, checkMobileApp } from './tasks.js';
 import { loadState, saveState, rollDay, addHistory, todayKey } from './store.js';
 
 let running = false;
@@ -189,6 +189,22 @@ export async function runOnce(opts = {}) {
       record.dailySet = await doAllDashboardTasks(page, cfg);
       if (record.dailySet.skipped?.length) {
         record.manualTasks = record.dailySet.skipped.map((t) => ({ title: t.title, points: t.points, href: t.href }));
+      }
+
+      // 拼图任务（只存在于 /earn 页，仪表盘看不到）
+      if (taskCfg.doQuests !== false) {
+        step = 'quests';
+        log.step(`${prefix} 执行拼图任务（积分赚取页的任务区）…`);
+        record.quests = await doQuests(page, cfg);
+        // 需要桌面 App 的拼图也归入「待人工」
+        for (const q of record.quests.needsApp || []) {
+          record.manualTasks = record.manualTasks || [];
+          record.manualTasks.push({
+            title: `${q.title}（需桌面奖励应用）`,
+            points: q.points,
+            href: q.href,
+          });
+        }
       }
     } else {
       log.info(`${prefix} [4/6] 任务处理已关闭，跳过。`);

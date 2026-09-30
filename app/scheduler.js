@@ -82,6 +82,9 @@ export function schedulerStatus() {
     intervalMinutes: s.intervalMinutes,
     maxRunsPerDay: s.maxRunsPerDay,
     staggerSeconds: s.staggerSeconds,
+    catchUp: s.catchUp !== false,
+    catchUpHours: s.catchUpHours == null ? 12 : s.catchUpHours,
+    runOnStart: !!s.runOnStart,
     nextRunAt: nextRunAt ? nextRunAt.toISOString() : null,
     nextRunLocal: fmtLocal(nextRunAt),
     running: isRunning(),
@@ -131,7 +134,7 @@ export function computeNextRun(accountId, now = new Date()) {
 }
 
 /** 判断某账号此刻是否到期 */
-function isDue(account, now) {
+function isDue(account, now, { manual = false } = {}) {
   const s = loadSettings().application.schedule;
   const st = rollDay(account.id);
   const dateKey = todayKey(now);
@@ -154,16 +157,32 @@ function isDue(account, now) {
     const slotDate = new Date(now);
     slotDate.setHours(t.h, t.min, 0, 0);
     const diffMin = (now.getTime() - slotDate.getTime()) / 60_000;
-    const due = diffMin >= 0 && (diffMin <= 1 || (s.catchUp && diffMin <= 12 * 60));
+
+    /*
+     * 常规巡检：到点（1 分钟内）或（开启补跑且在补跑窗口内）
+     * 手动检查：忽略补跑窗口——用户主动要求就执行，只受每账号每日上限约束
+     */
+    const windowHours = Math.max(0.25, Number(s.catchUpHours ?? 12));
+    const due = manual
+      ? true
+      : diffMin >= 0 && (diffMin <= 1 || (s.catchUp && diffMin <= windowHours * 60));
+
     if (due && !slotAlreadyRun(dateKey, account.id, raw)) {
-      return { slot: raw, note: diffMin <= 1 ? '按计划执行' : `补跑（迟到 ${Math.round(diffMin)} 分钟）` };
+      const note = diffMin <= 1 ? '按计划执行'
+        : (manual ? `手动检查补跑（迟到 ${Math.round(diffMin)} 分钟）` : `补跑（迟到 ${Math.round(diffMin)} 分钟）`);
+      return { slot: raw, note };
     }
   }
   return null;
 }
 
-/** 单次巡检：一个账号执行完再轮到下一个 */
-async function tick() {
+/**
+ * 单次巡检：一个账号执行完再轮到下一个
+ * @param {'schedule'|'startup'} trigger 触发方式（写入执行记录用）
+ * @param {{ manual?: boolean }} [opts] manual=true 时忽略补跑窗口（用于「立即检查计划」）
+ */
+export async function tick(trigger = 'schedule', opts = {}) {
+  const manual = !!opts.manual;
   const settings = loadSettings();
   const s = settings.application.schedule;
 
@@ -178,16 +197,16 @@ async function tick() {
 
   // 错峰：每个 tick 只启动一个账号，之间隔 N 个 tick
   const staggerTicks = Math.max(1, Math.ceil((Number(s.staggerSeconds || 90) * 1000) / TICK_MS));
-  if (staggerCounter > 0) {
+  if (!manual && staggerCounter > 0) {
     staggerCounter -= 1;
     return;
   }
 
   for (const account of accounts) {
-    const due = isDue(account, now);
+    const due = isDue(account, now, { manual });
     if (!due) continue;
 
-    const moreWaiting = accounts.some((a) => a.id !== account.id && !!isDue(a, now));
+    const moreWaiting = accounts.some((a) => a.id !== account.id && !!isDue(a, now, { manual }));
     if (moreWaiting) {
       staggerCounter = staggerTicks;
       log.debug(`多账号错峰：本次执行 [${account.label}]，约 ${(staggerTicks * TICK_MS) / 1000} 秒后执行下一个。`);
@@ -195,9 +214,21 @@ async function tick() {
 
     log.info(`⏰ 定时触发 [${account.label}]：${due.note}`);
     markSlot(todayKey(now), account.id, due.slot);
-    await runOnce({ trigger: 'schedule', accountId: account.id, cfg: resolveAccountConfig(account.id) });
+    await runOnce({ trigger, accountId: account.id, cfg: resolveAccountConfig(account.id) });
     return; // 一轮只跑一个账号
   }
+}
+
+/**
+ * 手动立即巡检一次（忽略补跑窗口与错峰等待）
+ * 用于控制台「立即检查计划」按钮——用户主动要求时就去执行，
+ * 只受「每账号每天最多执行」约束，避免重复刷取。
+ */
+export async function checkNow() {
+  if (isRunning()) return { ok: false, reason: 'already-running' };
+  staggerCounter = 0;
+  await tick('schedule', { manual: true });
+  return { ok: true };
 }
 
 /** 启动调度器 */
@@ -210,27 +241,40 @@ export function startScheduler() {
 
   log.info(
     `调度器已启动：模式=${s.mode === 'interval' ? `每 ${s.intervalMinutes} 分钟` : `每天 ${(s.dailyTimes || []).join(' / ')}`}，`
-    + `启用账号 ${enabledCount}/${settings.accounts.length} 个，每账号每天最多 ${s.maxRunsPerDay} 次`,
+    + `启用账号 ${enabledCount}/${settings.accounts.length} 个，每账号每天最多 ${s.maxRunsPerDay} 次，`
+    + `错峰 ${s.staggerSeconds || 90} 秒`,
   );
+
+  /*
+   * 错过时刻的处理说明（这是最容易让人误以为「不执行」的地方）：
+   *   catchUp=true  -> 过了计划时刻之后才打开软件，仍会在补跑窗口内补跑
+   *   catchUp=false -> 只认「计划时刻那一刻」，错过就等第二天，且不会有任何提示
+   */
+  if (s.mode !== 'interval') {
+    const winHours = s.catchUpHours == null ? 12 : s.catchUpHours;
+    if (s.catchUp === false) {
+      log.warn(
+        `提示：当前「错过时刻自动补跑」是关闭的。若计划时刻（${(s.dailyTimes || []).join(' / ')}）电脑未开机或软件未运行，`
+        + '当天将不会执行且没有提示。建议在设置里开启「错过时刻自动补跑」。',
+      );
+    } else {
+      log.info(`补跑窗口：错过计划时刻后 ${winHours} 小时内仍会自动补跑（可在设置中调整）。`);
+      if (s.runOnStart) log.info('已启用「软件启动后立即检查计划」：打开软件后会立刻检查并补跑。');
+    }
+  }
 
   // 启动后立即巡检一次（支持「启动补跑」）
   setTimeout(() => {
-    if (!s.runOnStart) return;
-    (async () => {
-      for (const account of getAccounts().filter((a) => a.enabled !== false)) {
-        if (isRunning()) return;
-        const st = rollDay(account.id);
-        const maxRuns = Math.max(1, Number(s.maxRunsPerDay || 2));
-        if ((st.todayRuns || 0) >= maxRuns) continue;
-        log.info(`软件启动，按设置为 [${account.label}] 补跑一次。`);
-        markSlot(todayKey(), account.id, 'startup');
-        await runOnce({ trigger: 'startup', accountId: account.id });
-      }
-    })().catch((e) => log.error('启动补跑失败:', e.message));
+    if (s.mode === 'interval') return;
+    if (!s.runOnStart && s.catchUp === false) return; // 两者都关就没有可补的
+    tick('startup').catch((e) => log.error('启动补跑失败:', e.message));
   }, 8000);
 
   timer = setInterval(() => {
-    tick().catch((e) => log.error('调度巡检出错:', e.message));
+    if (process.env.DSH_SCHED_DEBUG) {
+      log.debug(`[调度心跳] timer=${!!timer} 运行中=${isRunning()} 错峰计数=${staggerCounter}`);
+    }
+    tick('schedule').catch((e) => log.error('调度巡检出错:', e.message));
   }, TICK_MS);
 
   if (timer.unref) timer.unref();

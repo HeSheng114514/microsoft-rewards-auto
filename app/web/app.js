@@ -120,10 +120,12 @@
       $('runDetail').textContent = `正在执行账号 ${status.runningAccount || ''}，请稍候…`;
       $('btnRun').disabled = true;
       $('btnRunAll').disabled = true;
+      $('btnCheckNow').disabled = true;
       $('btnCancel').hidden = false;
     } else {
       $('btnRun').disabled = false;
       $('btnRunAll').disabled = false;
+      $('btnCheckNow').disabled = false;
       $('btnCancel').hidden = true;
       if (!last) {
         badge.className = 'badge idle';
@@ -157,6 +159,22 @@
     // 任务清单
     renderTasks(last);
 
+    // 调度告警：catchUp 关闭时，错过时刻不会有任何提示，最容易误以为"不执行"
+    const warn = $('schedWarn');
+    if (warn) {
+      const sch2 = (status && status.scheduler) || {};
+      const catchUpOff = sch2.enabled && sch2.mode === 'daily' && sch2.catchUp === false;
+      if (catchUpOff) {
+        warn.hidden = false;
+        warn.classList.remove('is-hidden');
+        warn.innerHTML = '<span>⚠️ 「错过时刻自动补跑」当前是<strong>关闭</strong>的：'
+          + `若计划时刻（${(sch2.dailyTimes || []).join(' / ')}）电脑未开机或软件没运行，当天就不会执行，也不会有提示。`
+          + '建议到「设置 → 定时执行」开启它。</span>';
+      } else {
+        warn.hidden = true;
+        warn.classList.add('is-hidden');
+      }    }
+
     const ov = $('accountOverview');
     const accounts = (status && status.accounts) || [];
     ov.innerHTML = accounts.length ? accounts.map((x) => `
@@ -185,8 +203,12 @@
     }
     const ds = last.dailySet;
     const items = ds.items || [];
+    const quests = last.quests || null;
     const manual = last.manualTasks || [];
-    summary.textContent = `发现 ${ds.totalPending || 0} 项 · 自动完成 ${ds.completed || 0} 项 · 待人工 ${manual.length} 项`;
+    const qTotal = quests ? (quests.total || 0) : 0;
+    summary.textContent = `发现 ${ds.totalPending || 0} 项 · 自动完成 ${ds.completed || 0} 项`
+      + (qTotal ? ` · 拼图 ${qTotal} 个` : '')
+      + ` · 待人工 ${manual.length} 项`;
 
     const rows = [];
     for (const it of items) {
@@ -198,7 +220,22 @@
         <span class="pill ${it.ok ? 'ok' : 'failed'}">${it.ok ? '已自动完成' : '失败'}</span>
       </div>`);
     }
+    // 拼图任务（赚取页的 punchcard）
+    const questNeedApp = new Set();
+    for (const q of (quests ? quests.items || [] : [])) {
+      const needApp = /需桌面奖励应用/.test(q.note || '');
+      if (needApp) questNeedApp.add(q.title);
+      rows.push(`<div class="list-row">
+        <div class="grow">
+          <div class="title">${esc(q.title)}${q.progress ? ` <span class="pill">${esc(q.progress)}</span>` : ''}</div>
+          <div class="sub">拼图任务 · ${esc(q.note || '')}</div>
+        </div>
+        <span class="pill ${q.ok ? 'ok' : ''}" ${needApp ? 'style="color:#e8b339"' : ''}>${q.ok ? '已执行' : (needApp ? '需桌面App' : '等待解锁')}</span>
+      </div>`);
+    }
     for (const t of manual) {
+      // 需桌面 App 的拼图已在上面列出，避免重复
+      if ([...questNeedApp].some((n) => t.title && t.title.includes(n))) continue;
       rows.push(`<div class="list-row">
         <div class="grow">
           <div class="title">${esc(t.title)}${t.points ? ` <span class="pill">+${t.points}</span>` : ''}</div>
@@ -350,6 +387,7 @@
     $('sched_max').value = s.maxRunsPerDay == null ? 2 : s.maxRunsPerDay;
     $('sched_stagger').value = s.staggerSeconds == null ? 90 : s.staggerSeconds;
     $('sched_catchup').checked = s.catchUp !== false;
+    $('sched_catchupHours').value = s.catchUpHours == null ? 12 : s.catchUpHours;
     $('sched_runOnStart').checked = !!s.runOnStart;
     $('sched_skipWeekends').checked = !!s.skipWeekends;
     fillTimes(s.dailyTimes || ['09:10']);
@@ -370,6 +408,7 @@
     const t = useGlobal ? Object.assign({}, global.tasks) : Object.assign({}, global.tasks, eff.tasks || {});
     $('tasks_enabled').checked = t.enabled !== false;
     $('tasks_dailySet').checked = t.doDailySet !== false;
+    $('tasks_quests').checked = t.doQuests !== false;
     $('tasks_claim').checked = t.claimPoints !== false;
     $('tasks_visitEarn').checked = t.visitEarnPage !== false;
     $('tasks_mobile').checked = t.checkMobileApp !== false;
@@ -440,6 +479,7 @@
         maxRunsPerDay: Number($('sched_max').value) || 2,
         staggerSeconds: Number($('sched_stagger').value) || 90,
         catchUp: $('sched_catchup').checked,
+        catchUpHours: Number($('sched_catchupHours').value) || 12,
         runOnStart: $('sched_runOnStart').checked,
         skipWeekends: $('sched_skipWeekends').checked,
       },
@@ -458,6 +498,7 @@
       tasks: {
         enabled: $('tasks_enabled').checked,
         doDailySet: $('tasks_dailySet').checked,
+        doQuests: $('tasks_quests').checked,
         claimPoints: $('tasks_claim').checked,
         visitEarnPage: $('tasks_visitEarn').checked,
         checkMobileApp: $('tasks_mobile').checked,
@@ -621,6 +662,12 @@
     const r = await api('/api/run-all', { method: 'POST' });
     if (r.ok) { toast(r.message || '已开始', 'ok'); setTimeout(refresh, 800); }
     else toast(r.error || '无法启动', 'err');
+  });
+  // 立即按计划检查：若有错过的执行时刻，为每个账号补跑
+  $('btnCheckNow').addEventListener('click', async () => {
+    const r = await api('/api/check-now', { method: 'POST' });
+    if (r.ok) { toast(r.message || '已开始检查计划', 'ok'); setTimeout(refresh, 1000); }
+    else toast(r.error || '检查失败', 'err');
   });
   $('btnCancel').addEventListener('click', async () => {
     const r = await api('/api/cancel', { method: 'POST' });
