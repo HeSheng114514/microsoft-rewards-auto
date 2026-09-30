@@ -6,10 +6,139 @@
  * 早期只解析 #dailyset，导致这些任务被整体漏掉。
  */
 import { log } from './logger.js';
-import { inspect, analyzeQuota, fetchEarnTasks, collectTasks, DASHBOARD, EARN } from './rewards.js';
+import {
+  inspect, analyzeQuota, fetchEarnTasks, collectTasks, fetchQuests, inspectQuest, DASHBOARD, EARN,
+} from './rewards.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
+
+/**
+ * 执行「拼图任务」（/earn 页 #quests 里的 punchcard）
+ *
+ * 这类任务的要点：
+ *   1. 它们**只存在于 /earn 页**，仪表盘上看不到（早期漏掉的就是它们）
+ *   2. 子活动带每日解锁门：完成一格后需等 24 小时才能推进下一格
+ *   3. CTA **只在当前可推进的那一格上渲染** —— 找到 CTA 就等于找到了能做的事
+ *   4. 部分拼图明确要求「必须在桌面奖励应用中完成」，网页端无法代劳
+ */
+export async function doQuests(page, cfg) {
+  const result = { total: 0, attempted: 0, clicked: 0, needsApp: [], waiting: [], items: [] };
+
+  let quests = [];
+  try {
+    quests = await fetchQuests(page);
+  } catch (err) {
+    log.warn('读取拼图任务失败：', err.message);
+    return result;
+  }
+
+  result.total = quests.length;
+  if (!quests.length) {
+    log.info('拼图任务：没有发现任务。');
+    return result;
+  }
+
+  for (const q of quests) {
+    if (q.done) {
+      log.info(`拼图「${q.title}」已全部完成 ${q.progress}。`);
+      result.items.push({ title: q.title, progress: q.progress, ok: true, note: '已完成' });
+      continue;
+    }
+
+    let info;
+    try {
+      info = await inspectQuest(page, q.href);
+    } catch (err) {
+      log.warn(`拼图「${q.title}」解析失败：${err.message}`);
+      continue;
+    }
+
+    const label = `拼图「${q.title}」${q.points ? ` +${q.points}` : ''} [${info.progress || q.progress || '?'}]`;
+
+    // 必须在桌面 App 内完成
+    if (info.requiresApp) {
+      result.needsApp.push({ title: q.title, points: q.points, progress: info.progress || q.progress, href: q.href });
+      log.warn(`${label} 需要「桌面奖励应用」内完成，网页端无法自动做（页面已明确说明）。`);
+      result.items.push({ title: q.title, progress: info.progress, ok: false, note: '需桌面奖励应用' });
+      continue;
+    }
+
+    // 当前没有可点击的 CTA -> 等待 24 小时门，或已无可推进项
+    if (!info.ctas.length) {
+      const reason = info.done && info.total != null && info.done >= info.total
+        ? '已全部完成'
+        : '当前无可执行动作（多为已完成上一格，需等 24 小时解锁下一格）';
+      result.waiting.push({ title: q.title, points: q.points, progress: info.progress || q.progress, reason, href: q.href });
+      log.info(`${label} 暂无可执行动作：${reason}`);
+      result.items.push({ title: q.title, progress: info.progress, ok: false, note: reason });
+      continue;
+    }
+
+    // 有 CTA -> 逐个点击（新标签页），点击后复核进度
+    log.step(`${label} 发现 ${info.ctas.length} 个可执行动作。`);
+    const before = info.progress;
+    let clickedAny = false;
+
+    for (const cta of info.ctas) {
+      result.attempted += 1;
+      log.step(`  执行 CTA「${cta.text}」 -> ${cta.href.slice(0, 70)}`);
+      try {
+        // 每次点击前回到拼图页，保证元素是最新渲染状态
+        await page.goto(q.href, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await sleep(rand(2500, 4000));
+
+        const handle = await page.evaluateHandle((href) => {
+          const links = [...document.querySelectorAll('a[href]')];
+          return links.find((a) => a.href === href) || null;
+        }, cta.href);
+        const el = handle.asElement();
+        if (!el) {
+          log.info('    该 CTA 已不在页面上（可能已处理），跳过。');
+          continue;
+        }
+
+        const popupPromise = page.context().waitForEvent('page', { timeout: 15000 }).catch(() => null);
+        await el.click().catch(() => {});
+        const popup = await popupPromise;
+
+        if (popup) {
+          await popup.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+          await sleep(rand(4000, 6500));
+          await popup.mouse.wheel(0, rand(300, 900)).catch(() => {});
+          await sleep(rand(1500, 3000));
+          await popup.close().catch(() => {});
+        } else {
+          await sleep(rand(3500, 5500));
+          await page.mouse.wheel(0, rand(300, 800)).catch(() => {});
+        }
+        clickedAny = true;
+        result.clicked += 1;
+      } catch (err) {
+        log.warn(`    执行失败：${err.message}`);
+      }
+      await sleep(rand(1500, 3000));
+    }
+
+    // 复核进度
+    try {
+      await sleep(2500);
+      const recheck = await inspectQuest(page, q.href);
+      const after = recheck.progress;
+      const advanced = before && after && before !== after;
+      if (advanced) log.success(`${label} 进度推进：${before} → ${after}`);
+      else if (clickedAny) log.info(`${label} 已执行动作，进度暂仍为 ${after}（入账可能有延迟）。`);
+      result.items.push({
+        title: q.title,
+        progress: after,
+        ok: clickedAny,
+        note: advanced ? `进度 ${before} → ${after}` : '已执行动作',
+      });
+    } catch { /* 复核失败不影响主流程 */ }
+  }
+
+  return result;
+}
 
 /**
  * 通用「访问型」任务执行：打开链接、模拟浏览、必要时点一下页面主按钮
@@ -58,7 +187,9 @@ export async function visitTask(page, task) {
  * - kind=reward-goal   设定奖励目标（需要挑选礼品卡，无法自动完成 -> 跳过并提示）
  */
 export async function doAllDashboardTasks(page, cfg) {
-  const result = { attempted: 0, completed: 0, skipped: [], items: [], totalPending: 0, pending: [] };
+  const result = {
+    attempted: 0, completed: 0, skipped: [], waiting: [], items: [], totalPending: 0, pending: [],
+  };
 
   /**
    * 按「真人行为」执行任务：在仪表盘上点击卡片本身（target=_blank 会开新标签页）。
@@ -140,6 +271,31 @@ export async function doAllDashboardTasks(page, cfg) {
       result.skipped.push(task);
       log.warn(`跳过「${task.title}」：需要你在积分商城中挑选并设定一个奖励目标（人工完成，+${task.points ?? '?'} 分）。`);
       log.info('  入口：https://rewards.bing.com/redeem/?section=shop');
+      continue;
+    }
+
+    /*
+     * 「搜索 N 天」连击任务：由**搜索步骤**驱动，不是独立的页面访问动作。
+     *
+     * 实测：如「开始使用 Rewards」里的「搜索 7 天 +500」，要求「每天在必应搜索
+     * 至少一次、连续七天」。打开 bing.com 首页不会推进它，只有真正执行搜索才会
+     * 被记录，而且服务端按天结算（当天一次即够，无法一次跑完）。
+     * 所以这里不做冗余访问，只汇报状态并说明推进方式。
+     */
+    if (task.kind === 'search-streak') {
+      const prog = task.progress || '?';
+      result.waiting.push({
+        title: task.title,
+        points: task.points,
+        progress: prog,
+        reason: '连击任务：需每天在必应搜索至少一次，连续多天才能完成',
+        href: task.href,
+      });
+      log.info(`连击任务「${task.title}」+${task.points ?? '?'} [${prog}]：由本次搜索步骤推进，`
+        + '但需每天搜索一次、连续多天，无法在单次运行里跑完。');
+      result.items.push({
+        title: task.title, points: task.points, ok: false, kind: task.kind, note: '连击任务，由搜索步骤推进',
+      });
       continue;
     }
 
