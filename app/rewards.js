@@ -213,6 +213,8 @@ export async function inspect(page) {
     /** 根据标题/来源推断任务类型 */
     const categoryOf = (title, origin) => {
       if (/设定奖励目标|奖励目标/.test(title)) return 'reward-goal';
+      // 「搜索 N 天」这类连击任务：由搜索步骤驱动、需连续多天，不能当普通访问处理
+      if (/搜索\s*\d+\s*天|连续\s*\d+\s*天搜索|搜索连续|搜索.*连续\s*\d+\s*天/.test(title)) return 'search-streak';
       if (origin === 'dailyset') return 'search';
       if (/测验|问答|小测|quiz/i.test(title)) return 'quiz';
       if (/浏览|查看|访问|赚取页面|了解/.test(title)) return 'visit';
@@ -403,6 +405,185 @@ export async function fetchEarnTasks(page) {
     return out.filter((t) => (seen.has(t.href) ? false : (seen.add(t.href), true)));
   });
   return tasks;
+}
+
+/** 带分隔的文本提取（应对 React Aria 隐藏测量层导致 innerText 为空） */
+const TEXT_HELPER = `
+  const textWithSpaces = (root) => {
+    if (!root) return '';
+    const buf = [];
+    const walk = (n) => {
+      if (n.nodeType === 3) { const t = (n.nodeValue || '').trim(); if (t) buf.push(t); return; }
+      if (n.nodeType !== 1) return;
+      if (['SCRIPT','STYLE','NOSCRIPT'].includes(n.tagName)) return;
+      for (const c of n.childNodes) walk(c);
+      buf.push(' ');
+    };
+    walk(root);
+    return buf.join('').replace(/\\s+/g, ' ').trim();
+  };
+  const txt = (el) => {
+    const t = el ? (el.innerText || '').replace(/\\s+/g, ' ').trim() : '';
+    return t || textWithSpaces(el);
+  };
+`;
+
+/**
+ * 采集积分赚取页（/earn）上的「拼图任务」（#quests）
+ *
+ * 这类任务与仪表盘任务不同：**只存在于 /earn 页**，形如
+ *   「探索九月流行的时尚… +50  2/4 个任务」 → /earn/quest/<offerId>
+ * 且带每日解锁门（完成一格后需等 24 小时才能推进下一格）。
+ */
+export async function fetchQuests(page) {
+  await page.goto(EARN, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(6000);
+
+  const quests = await page.evaluate(new Function(`
+    ${TEXT_HELPER}
+    const box = document.querySelector('#quests');
+    if (!box) return [];
+
+    /*
+     * 标题定位：每张拼图卡在 DOM 里是一个 h3（标题）+ 状态行。
+     * 不能用 closest('div') —— 会抓到包含多张卡的外层容器，导致所有卡标题相同。
+     * 改为「在包含该链接的容器内找 h3/h4，取与本卡文本匹配的那个」。
+     */
+    const out = [];
+    for (const a of box.querySelectorAll('a[href*="/earn/quest/"]')) {
+      /*
+       * 向上找到「只包含这一张卡」的容器：
+       * 从链接本身开始逐级上溯，一旦某个祖先里出现了**别的**拼图链接，
+       * 就说明上一层已经是列表容器，此时退回上一层作为卡片边界。
+       */
+      let card = a;
+      let t = txt(a);
+      for (let i = 0; i < 6 && card.parentElement; i++) {
+        const up = card.parentElement;
+        const links = [...up.querySelectorAll('a[href*="/earn/quest/"]')];
+        const others = links.filter((x) => x.href !== a.href);
+        if (others.length > 0) break; // 越界，保留 card 为准
+        card = up;
+        t = txt(up);
+      }
+      const pm = t.match(/(\\d+)\\s*\\/\\s*(\\d+)\\s*个任务/);
+      const done = pm ? Number(pm[1]) : null;
+      const total = pm ? Number(pm[2]) : null;
+
+      // 标题：优先容器内的 h3/h4
+      let title = '';
+      const hd = card.querySelector('h3, h4');
+      if (hd) title = txt(hd);
+      if (!title) {
+        const ps = [...card.querySelectorAll('p')].map((p) => txt(p))
+          .filter((x) => x && x.length >= 4 && !/^[\\d,+\\/\\s]+$/.test(x) && !/个任务|到期日期|状态/.test(x));
+        title = ps[0] || '';
+      }
+
+      out.push({
+        origin: 'quest',
+        href: a.href,
+        title: String(title).slice(0, 60),
+        text: t.slice(0, 200),
+        points: (() => { const m = t.match(/\\+\\s*(\\d+)/); return m ? Number(m[1]) : null; })(),
+        progress: pm ? pm[1] + '/' + pm[2] : null,
+        progressDone: done,
+        progressTotal: total,
+        done: done != null && total != null ? done >= total : false,
+        kind: 'quest',
+      });
+    }
+    const seen = new Set();
+    return out.filter((q) => (seen.has(q.href) ? false : (seen.add(q.href), true)));
+  `));
+
+  return quests || [];
+}
+
+/**
+ * 解析拼图任务详情页：
+ *   - 当前进度（状态: X/Y 个任务）
+ *   - 可点击的 CTA（**只在当前可推进的那一格上渲染**）
+ *   - 是否属于必须用桌面 App 才能完成的任务
+ */
+export async function inspectQuest(page, questUrl) {
+  await page.goto(questUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(6000);
+
+  return await page.evaluate(new Function(`
+    ${TEXT_HELPER}
+    const body = txt(document.body);
+    const pm = body.match(/状态[:：]\\s*(\\d+)\\s*\\/\\s*(\\d+)/);
+    const done = pm ? Number(pm[1]) : null;
+    const total = pm ? Number(pm[2]) : null;
+
+    // 需要桌面 App 的任务：页面会明确写出
+    const requiresApp = /必须在桌面奖励应用中完成|必须在.{0,10}应用中完成|desktop rewards app/i.test(body);
+
+    /*
+     * 逐个子活动卡片解析。
+     *
+     * 关键特性：CTA **只在「当前可推进的那一格」上渲染**——
+     * 已完成的格子、以及还在等 24 小时门（未解锁）的格子都不会有 CTA。
+     * 实测：锁定项里连 <a> 都不存在，所以「卡片内有站外链接」等价于「现在可以做这件事」。
+     *
+     * 因此**不依赖按钮文案**：Rewards 会改文案（早期是「开始规划」，后来变成
+     * 「选购同款」），用固定动词白名单会导致 CTA 被整体漏掉、拼图永远不推进。
+     */
+    const NAV_RE = /^(首页|积分赚取|兑换|关于|邀请好友赚积分|更多活动|必应|Xbox|反馈|简体中文|帮助|常见问题解答|最佳做法|网站地图|隐私声明|使用条款|关于 Microsoft|公司资讯|隐私与 Cookie|关于我们的广告|管理 Cookie|接受|拒绝)$/;
+    // 全站页脚链接：即便落在卡片内也要排除
+    const FOOTER_URL_RE = /support\\.microsoft|microsoft\\.com\\/about|news\\.microsoft|choice\\.microsoft|go\\.microsoft|account\\/general|xbox\\.com/i;
+
+    const activities = [];
+    for (const h of document.querySelectorAll('h3')) {
+      // 只处理拼图详情页里的子活动（标题位于活动卡片区域内）
+      let card = h;
+      let t = txt(h);
+      for (let i = 0; i < 4 && card.parentElement; i++) {
+        const up = card.parentElement;
+        // 越界判定：容器里出现了另一个 h3，说明上层是整块列表
+        if (up.querySelectorAll('h3').length > 1) break;
+        card = up;
+        t = txt(card);
+      }
+
+      const heading = txt(h);
+
+      // 卡片内的行动入口：站外链接 + 非导航文案 + 非页脚 URL
+      // （「必应」这个 bing.com/?rwgbopen=1 导航项靠 NAV_RE 排除）
+      const links = [...card.querySelectorAll('a[href]')]
+        .map((a) => ({ text: txt(a).slice(0, 30), href: a.href }))
+        .filter((l) => {
+          if (!l.text || NAV_RE.test(l.text)) return false;
+          if (/rewards\\.bing\\.com\\//i.test(l.href)) return false;
+          if (FOOTER_URL_RE.test(l.href)) return false;
+          return /bing\\.com|microsoft\\.com/i.test(l.href);
+        });
+
+      const waiting = /等待\\s*24\\s*小时|完成后等待|天后等待|第二天/i.test(t);
+      const doneMark = /已完成|已打卡/.test(t);
+
+      activities.push({
+        title: heading.slice(0, 50),
+        text: t.slice(0, 220),
+        waiting,
+        done: doneMark,
+        ctas: links,
+      });
+    }
+
+    return {
+      url: location.href,
+      title: document.title,
+      done, total,
+      progress: pm ? pm[1] + '/' + pm[2] : null,
+      requiresApp,
+      activities,
+      // 所有可用 CTA 汇总（供执行器使用）
+      ctas: activities.flatMap((a) => a.ctas),
+      bodyStart: body.slice(0, 260),
+    };
+  `));
 }
 
 export { DASHBOARD, EARN };
