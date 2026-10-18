@@ -4,6 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Microsoft Rewards 自动签到</title>
+<link rel="icon" href="/favicon.ico" />
 <link rel="stylesheet" href="/app.css" />
 </head>
 <body>
@@ -27,6 +28,7 @@
       <button class="nav-btn active" data-view="dashboard"><span>📊</span>总览</button>
       <button class="nav-btn" data-view="accounts"><span>👥</span>账号管理</button>
       <button class="nav-btn" data-view="settings"><span>⚙️</span>设置</button>
+      <button class="nav-btn" data-view="backup"><span>💾</span>备份与恢复</button>
       <button class="nav-btn" data-view="history"><span>🗂️</span>历史记录</button>
       <button class="nav-btn" data-view="logs"><span>📜</span>运行日志</button>
     </nav>
@@ -231,6 +233,7 @@
         <div class="form-row checks">
           <label class="switch"><input type="checkbox" id="tasks_enabled" /><span></span>启用任务处理</label>
           <label class="switch"><input type="checkbox" id="tasks_dailySet" /><span></span>完成每日活动任务</label>
+          <label class="switch"><input type="checkbox" id="tasks_dailyTasks" /><span></span>完成日常任务（赚取页）</label>
           <label class="switch"><input type="checkbox" id="tasks_quests" /><span></span>完成拼图任务（赚取页）</label>
           <label class="switch"><input type="checkbox" id="tasks_claim" /><span></span>自动领取可领取积分</label>
           <label class="switch"><input type="checkbox" id="tasks_visitEarn" /><span></span>刷新积分赚取页</label>
@@ -268,6 +271,71 @@
           <label class="switch"><input type="checkbox" id="tray_autostart" /><span></span>开机自动启动</label>
         </div>
         <div class="tip">开启托盘后，关闭控制台页面软件仍会在后台按计划执行。</div>
+      </div>
+    </section>
+
+    <!-- ============ 备份与恢复 ============ -->
+    <section class="view" id="view-backup">
+      <header class="page-head">
+        <h1>备份与恢复</h1>
+        <div class="actions">
+          <button class="btn primary" id="btnExport">导出备份</button>
+          <button class="btn" id="btnPickImport">导入备份…</button>
+          <input type="file" id="importFile" accept=".zip" hidden />
+        </div>
+      </header>
+
+      <div class="card tip-card">
+        <p>把本工具的数据打包成一个 <code>.zip</code>，可用于<strong>换电脑迁移</strong>、<strong>重装后恢复</strong>或<strong>定期存档</strong>。</p>
+        <p>选择要包含的内容后点「导出备份」；恢复时点「导入备份…」选择文件，再决定用哪种方式合并。</p>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>1. 选择要备份的内容</h2>
+          <div class="actions">
+            <button class="btn ghost sm" id="btnCatAll">全选</button>
+            <button class="btn ghost sm" id="btnCatNone">全不选</button>
+            <button class="btn ghost sm" id="btnCatSafe">仅基础项</button>
+          </div>
+        </div>
+        <div id="catList" class="cat-list"><div class="muted">正在统计…</div></div>
+        <div class="cat-total" id="catTotal"></div>
+        <div class="form-row">
+          <label>备份文件名</label>
+          <input type="text" id="backupName" placeholder="留空自动命名" style="min-width:280px" />
+          <div class="tip">只允许字母、数字、中文、点、横线、下划线，必须以 .zip 结尾。</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>2. 已有备份</h2><button class="btn ghost sm" id="btnRefreshBackups">刷新</button></div>
+        <div id="backupList" class="list"><div class="muted">暂无备份</div></div>
+        <div class="tip" id="backupDirTip"></div>
+      </div>
+
+      <div class="card" id="importPanel" hidden>
+        <div class="card-head"><h2>3. 恢复备份</h2></div>
+        <div id="importPreview"></div>
+        <div class="form-row">
+          <label>恢复方式</label>
+          <select id="importMode" style="min-width:320px">
+            <option value="merge">合并（推荐）— 保留本地数据，补充备份中的内容，不删除任何东西</option>
+            <option value="overwrite">覆盖 — 用备份内容完整替换，本地同名数据会被覆盖</option>
+          </select>
+        </div>
+        <div class="form-row" id="importCatRow">
+          <label>恢复哪些内容</label>
+          <div class="inline-list" id="importCats"></div>
+        </div>
+        <div class="form-row">
+          <button class="btn primary" id="btnRestore">开始恢复</button>
+          <button class="btn ghost" id="btnCancelImport">取消</button>
+        </div>
+        <div class="tip" style="margin-left:0">
+          提示：恢复「浏览器登录态」会替换该账号的登录信息；合并模式下会把本地原有登录态备份为
+          <code>browser-profile.bak-时间戳</code>，不会直接丢弃。
+        </div>
       </div>
     </section>
 
