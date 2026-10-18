@@ -57,6 +57,7 @@ export const DEFAULT_APPLICATION = {
   tasks: {
     enabled: true,
     doDailySet: true,           // 完成「每日活动」里的搜索类任务
+    doDailyTasks: true,         // 完成积分赚取页的「日常任务」区（#moreactivities）
     doQuests: true,             // 完成积分赚取页的「拼图任务」（punchcard）
     claimPoints: true,          // 自动领取「可领取」积分
     visitEarnPage: true,        // 访问积分赚取页
@@ -75,7 +76,7 @@ export const DEFAULT_APPLICATION = {
 
 export const DEFAULT_ACCOUNT_OVERRIDES = {
   search: { enabled: true, maxSearches: 40, mobileMode: false, querySource: 'mixed', customQueries: [] },
-  tasks: { enabled: true, doDailySet: true, doQuests: true, claimPoints: true, visitEarnPage: true, doQuizzes: false, checkMobileApp: true },
+  tasks: { enabled: true, doDailySet: true, doDailyTasks: true, doQuests: true, claimPoints: true, visitEarnPage: true, doQuizzes: false, checkMobileApp: true },
   browser: { kind: 'msedge', headless: true, executablePath: '' },
 };
 
