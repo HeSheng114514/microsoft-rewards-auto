@@ -8,8 +8,9 @@ import {
 import { launchBrowser, closeBrowser, getPage, readAccountName, screenshot } from './browser.js';
 import { inspect, analyzeQuota, bingPoints, homeValueMismatch, DASHBOARD } from './rewards.js';
 import { runSearches } from './search.js';
-import { doAllDashboardTasks, doQuests, doQuizzes, claimPoints, visitEarn, checkMobileApp } from './tasks.js';
+import { doAllDashboardTasks, doDailyTasks, doQuests, doQuizzes, claimPoints, visitEarn, checkMobileApp } from './tasks.js';
 import { loadState, saveState, rollDay, addHistory, todayKey } from './store.js';
+import { checkNetwork } from './net.js';
 
 let running = false;
 let cancelRequested = false;
@@ -94,6 +95,22 @@ export async function runOnce(opts = {}) {
     step = 'login-check';
     log.step(`${prefix} [1/6] 检查登录状态…`);
     /*
+     * 网络预检：先确认能打开 Rewards 页面。
+     * 断网时后续每一步都会各自超时 60 秒，并产生 chrome-error://chromewebdata
+     * 这类连锁报错——这里提前识别，直接给出明确原因，而不是让用户面对一堆超时。
+     */
+    const preflight = await checkNetwork(page);
+    if (!preflight.ok) {
+      const msg = `网络不可用：${preflight.reason}。请检查网络连接/代理后重新执行（本次未做任何操作）。`;
+      log.error(`${prefix} ${msg}`);
+      log.warn(`${prefix}   诊断：打开 https://rewards.bing.com/dashboard 失败 —— ${preflight.detail || preflight.reason}`);
+      record.status = 'failed';
+      record.message = msg;
+      record.networkOffline = true;
+      return finalize(record, accountId);
+    }
+
+    /*
      * 登录判定必须基于 Rewards 页面，而不是必应页头：
      * 实测同一个浏览器配置里，必应页头可能停在**另一个账号**的会话上，
      * 只看页头会误判为已登录，随后就用错误的会话去搜索。
@@ -161,6 +178,8 @@ export async function runOnce(opts = {}) {
 
     // ---------- 4. 执行搜索 ----------
     const searchCfg = cfg.search || {};
+    // 搜索阶段若判定断网，后续任务阶段不再尝试（否则每个阶段都要白等一次超时）
+    let networkOffline = false;
     if (searchCfg.enabled !== false) {
       step = 'search';
       log.step(`${prefix} [3/6] 开始自动搜索赚取积分…`);
@@ -173,13 +192,34 @@ export async function runOnce(opts = {}) {
         gained: sres.gained,
         pointsBefore: sres.pointsBefore,
         pointsAfter: sres.pointsAfter,
+        failed: sres.failed,
       };
-      log.success(`${prefix} 搜索完成：实际搜索 ${sres.performed} 次，积分增长 ${sres.gained >= 0 ? '+' : ''}${sres.gained}`);
+      if (sres.stoppedBy === 'network-offline') {
+        networkOffline = true;
+        record.networkOffline = true;
+        log.error(`${prefix} 搜索因网络中断提前结束（成功 ${sres.performed} 次，失败 ${sres.failed || 0} 次）。`);
+      } else {
+        log.success(`${prefix} 搜索完成：实际搜索 ${sres.performed} 次，积分增长 ${sres.gained >= 0 ? '+' : ''}${sres.gained}`);
+      }
     } else {
       log.info(`${prefix} [3/6] 搜索功能已关闭，跳过。`);
     }
 
     if (cancelRequested) throw new Error('cancelled');
+
+    if (networkOffline) {
+      /*
+       * 已确认断网：跳过全部后续任务阶段。
+       * 否则每个阶段都会各自等一次 60 秒超时，并产生 "chrome-error://chromewebdata"
+       * 这类连锁报错（实测曾因此白耗十几分钟）。
+       */
+      log.warn(`${prefix} ⏭ 因网络不可用，跳过后续任务处理（仪表盘/日常任务/拼图/领取积分）。`);
+      log.warn(`${prefix}   请恢复网络后重新执行；本次不视为代码故障。`);
+      record.skippedDueToNetwork = true;
+      record.message = `网络不可用：搜索尝试 ${record.searches} 次后中止，任务阶段已跳过`;
+      record.status = 'failed';
+      return finalize(record, accountId);
+    }
 
     // ---------- 5. 仪表盘任务（每日活动 + 新手引导等） ----------
     const taskCfg = cfg.tasks || {};
@@ -189,6 +229,17 @@ export async function runOnce(opts = {}) {
       record.dailySet = await doAllDashboardTasks(page, cfg);
       if (record.dailySet.skipped?.length) {
         record.manualTasks = record.dailySet.skipped.map((t) => ({ title: t.title, points: t.points, href: t.href }));
+      }
+
+      // 日常任务（只存在于 /earn 页的 #moreactivities 区块）
+      if (taskCfg.doDailyTasks !== false) {
+        step = 'daily-tasks';
+        log.step(`${prefix} 执行日常任务（积分赚取页的日常任务区）…`);
+        record.dailyTasks = await doDailyTasks(page, cfg);
+        for (const t of record.dailyTasks.skipped || []) {
+          record.manualTasks = record.manualTasks || [];
+          record.manualTasks.push({ title: t.title, points: t.points, href: t.href });
+        }
       }
 
       // 拼图任务（只存在于 /earn 页，仪表盘看不到）
@@ -321,7 +372,9 @@ function finalize(record, accountId) {
 function buildMessage(record) {
   const parts = [];
   if (record.searches) parts.push(`搜索 ${record.searches} 次`);
-  if (record.dailySet?.completed) parts.push(`完成任务 ${record.dailySet.completed} 项`);
+  if (record.dailySet?.completed) parts.push(`每日活动 ${record.dailySet.completed} 项`);
+  if (record.dailyTasks?.clicked) parts.push(`日常任务 ${record.dailyTasks.clicked} 项`);
+  if (record.quests?.clicked) parts.push(`拼图动作 ${record.quests.clicked} 个`);
   if (record.claimed?.claimed) parts.push(`领取积分 ${record.claimed.amount ?? ''}`);
   const gain = (record.pointsAfter ?? 0) - (record.pointsBefore ?? 0);
   if (record.pointsBefore != null && record.pointsAfter != null) parts.push(`积分 +${gain}`);
