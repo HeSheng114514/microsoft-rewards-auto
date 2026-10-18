@@ -4,6 +4,7 @@
 import { log } from './logger.js';
 import { generateQueries } from './queries.js';
 import { bingPoints, dashboardPoints, homeValueMismatch } from './rewards.js';
+import { NetworkGuard } from './net.js';
 
 const HOME = 'https://cn.bing.com/';
 
@@ -112,7 +113,16 @@ export async function runSearches(page, cfg, opts = {}) {
   const minDelay = Math.max(500, Number(s.minDelayMs ?? 2500));
   const maxDelay = Math.max(minDelay, Number(s.maxDelayMs ?? 7000));
 
-  const summary = { performed: 0, queries: [], pointsBefore: null, pointsAfter: null, gained: 0, stoppedBy: 'unknown' };
+  const summary = {
+    performed: 0, queries: [], pointsBefore: null, pointsAfter: null, gained: 0,
+    stoppedBy: 'unknown', failed: 0, consecutiveErrors: 0,
+  };
+
+  /*
+   * 网络熔断：断网时不要傻跑满 target 次。
+   * 每个失败都会喂给 guard，连续 N 次网络类错误即判定离线、中止本轮。
+   */
+  const guard = new NetworkGuard({ threshold: 3, name: '搜索' });
 
   // 移动端模式：切换 UA / 视口，用于覆盖移动端搜索额度
   if (s.mobileMode) {
@@ -139,6 +149,12 @@ export async function runSearches(page, cfg, opts = {}) {
   summary.pointsBefore = dashBefore ?? headerBefore;
   summary.headerBefore = headerBefore;
   summary.sessionMismatch = mismatched;
+
+  /**
+   * 页头是否已不可信（运行期可变）。
+   * 开头就错配 -> 直接禁用页头；否则在循环中每轮验算，发现漂移再禁用。
+   */
+  let headerUnusable = mismatched;
 
   // 起始积分已知才可做「刷满即停」判定
   const verifiable = s.verifyPoints !== false && summary.pointsBefore != null && summary.pointsBefore > 0;
@@ -179,14 +195,41 @@ export async function runSearches(page, cfg, opts = {}) {
   let noGainStreak = 0;
 
   for (let i = 0; i < target; i++) {
+    // 已判定离线则立刻中止，不再做无意义的重试
+    if (guard.isOffline()) {
+      summary.stoppedBy = 'network-offline';
+      log.error(`网络不可用，搜索在第 ${i + 1}/${target} 次前中止。`);
+      break;
+    }
+
     const query = pool[i];
     log.step(`[${i + 1}/${target}] 搜索：「${query}」`);
 
     let url = '';
     try {
       url = await performSearch(page, query);
+      guard.recordSuccess();
+      summary.consecutiveErrors = 0;
     } catch (err) {
-      log.warn(`第 ${i + 1} 次搜索出错：${err.message}`);
+      summary.failed += 1;
+      const kind = guard.recordFailure(err);
+      summary.consecutiveErrors = Math.floor(guard.consecutive);
+      summary.lastErrorKind = kind;
+
+      // 断网类错误：只记一行精简日志，不打印完整 Call log 噪声
+      const brief = String(err.message || '').split('\n')[0].slice(0, 120);
+      if (kind === 'offline') {
+        log.warn(`第 ${i + 1} 次搜索失败（网络）：${brief}`);
+      } else {
+        log.warn(`第 ${i + 1} 次搜索出错：${brief}`);
+      }
+
+      // 记录连续失败，用于最终判定
+      if (guard.isOffline()) {
+        summary.stoppedBy = 'network-offline';
+        log.error(`已连续 ${guard.totalOffline} 次网络失败，停止搜索并结束本轮搜索阶段。`);
+        break;
+      }
       continue;
     }
     summary.performed += 1;
@@ -196,12 +239,15 @@ export async function runSearches(page, cfg, opts = {}) {
     await humanScroll(page, rand(1, 3));
 
     /*
-     * 积分校验策略（按可靠性排序）：
-     *   1) 会话错配 / 页头读不到时 —— 直接读 Rewards 仪表盘（账号权威值）
-     *   2) 会话正常时 —— 用页头做廉价的相对变化判断，
-     *      每 5 次搜索再用仪表盘校准一次，避免长时间偏离真实值
+     * 积分校验策略：
+     *   优先用页头（廉价、实时），但**每次都验算它是否属于本账号**。
+     *
+     * 为什么必须每轮验证：必应页头的会话可能在运行过程中"漂移"到别的账号
+     * （实测同一浏览器配置里，页头一会儿是本账号、一会儿是另一个账号的积分），
+     * 只在开头判断一次会让后续判定全部错乱 —— 出现「积分 +3210」这种跨账号读数，
+     * 并让「刷满即停」逻辑失效。
      */
-    const useHeader = !summary.sessionMismatch;
+    let useHeader = !headerUnusable;
     let now = null;
     let gainSource = '';
 
@@ -217,30 +263,87 @@ export async function runSearches(page, cfg, opts = {}) {
         }
       }
       gainSource = '页头';
+
+      /*
+       * 立即合理性检查（**不等后面的校准轮次**）：
+       * 单次搜索的积分增幅是个位数级别，页头读数若与已知基准相差过大，
+       * 几乎必然是页头会话已漂移到别的账号。此时立刻丢弃页头并改读仪表盘，
+       * 否则会算出「积分 +3210」这类跨账号读数并污染后续判定。
+       */
+      if (now != null && lastPoints != null && homeValueMismatch(now, lastPoints)) {
+        headerUnusable = true;
+        summary.sessionMismatch = true;
+        log.warn(
+          `⚠ 必应页头读数（${now}）与已知基准（${lastPoints}）差距过大，`
+          + '判定页头会话已漂移到其他账号，立即改用仪表盘判断额度。',
+        );
+        log.warn('  建议对本账号重新「登录」，并确认必应首页显示的是本账号。');
+        now = null;            // 丢弃页头读数
+        gainSource = '';
+        useHeader = false;
+      }
     }
 
-    // 页头不可用，或没读到增长 -> 用仪表盘复核
-    if (!useHeader || now === null || (verifiable && lastPoints != null && now <= lastPoints)) {
+    /*
+     * 每 3 次搜索（或页头读数可疑时）用仪表盘做权威校验：
+     * 若页头与仪表盘差距过大 -> 判定页头属于别的账号，之后本轮永久改用仪表盘。
+     */
+    const needAuthorityCheck = useHeader && (
+      now === null
+      || (verifiable && lastPoints != null && now <= lastPoints)
+      || (i + 1) % 3 === 0
+    );
+
+    if (!useHeader || needAuthorityCheck) {
       await sleep(1800);
       const dashNow = await readAuthoritative();
       if (dashNow != null) {
+        if (useHeader && now != null && homeValueMismatch(now, dashNow)) {
+          headerUnusable = true;
+          summary.sessionMismatch = true;
+          log.warn(
+            `⚠ 检测到必应页头读数（${now}）与本账号仪表盘（${dashNow}）不一致，`
+            + '判定页头会话已漂移到其他账号，本轮起改用仪表盘判断额度。',
+          );
+          log.warn('  建议对本账号重新「登录」，并确认必应首页显示的是本账号。');
+        }
         now = dashNow;
-        gainSource = '仪表盘';
-      }
-    } else if (verifiable && (i + 1) % 5 === 0) {
-      const dashNow = await readAuthoritative();
-      if (dashNow != null && lastPoints != null && homeValueMismatch(now, dashNow)) {
-        log.info(`校准积分读数：页头 ${now} → 仪表盘 ${dashNow}`);
-        now = dashNow;
-        gainSource = '仪表盘(校准)';
+        gainSource = useHeader && !headerUnusable ? '仪表盘(校准)' : '仪表盘';
       }
     }
 
+    /*
+     * 更新基准值。
+     * 注意：lastPoints 必须始终保持「本账号的真实分数」语义。
+     * 只有当读数来源可信（仪表盘，或页头已通过合理性检查）时才更新基准，
+     * 否则会把外来账号的分数固化进基准，导致后续所有比较失真。
+     */
     if (now !== null && lastPoints !== null && now > lastPoints) {
-      log.success(`积分 +${now - lastPoints}（当前 ${now}，来源：${gainSource}）`);
-      lastPoints = now;
-      noGainStreak = 0;
-      summary.pointsAfter = lastPoints;
+      /*
+       * 单次搜索的合理增幅上限：正常为个位数。
+       * 若一次就涨了几百上千分，说明读数串了账号 —— 丢弃，不计入。
+       */
+      const delta = now - lastPoints;
+      const implausible = delta > 50;
+
+      if (implausible) {
+        log.warn(
+          `⚠ 检测到异常积分增幅 +${delta}（${lastPoints} → ${now}，来源：${gainSource}），`
+          + '不符合单次搜索的合理范围，已丢弃该读数（疑似读数串到其他账号）。',
+        );
+        headerUnusable = true;
+        summary.sessionMismatch = true;
+        if (gainSource === '页头') {
+          // 拿权威值重新校准基准
+          const auth = await dashboardPoints(page);
+          if (auth != null) lastPoints = auth;
+        }
+      } else {
+        log.success(`积分 +${delta}（当前 ${now}，来源：${gainSource}）`);
+        lastPoints = now;
+        noGainStreak = 0;
+        summary.pointsAfter = lastPoints;
+      }
     } else if (!verifiable) {
       // 无法校验时只记录，不判定刷满
       noGainStreak = 0;
