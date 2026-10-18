@@ -20,6 +20,7 @@
       document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
       btn.classList.add('active');
       $('view-' + btn.dataset.view).classList.add('active');
+      if (btn.dataset.view === 'backup') refreshBackupView();
     });
   });
   $('btnGoHistory').addEventListener('click', () => document.querySelector('[data-view="history"]').click());
@@ -204,9 +205,12 @@
     const ds = last.dailySet;
     const items = ds.items || [];
     const quests = last.quests || null;
+    const dailyTasks = last.dailyTasks || null;
     const manual = last.manualTasks || [];
     const qTotal = quests ? (quests.total || 0) : 0;
+    const dTotal = dailyTasks ? (dailyTasks.total || 0) : 0;
     summary.textContent = `发现 ${ds.totalPending || 0} 项 · 自动完成 ${ds.completed || 0} 项`
+      + (dTotal ? ` · 日常任务 ${dailyTasks.clicked || 0}/${dTotal}` : '')
       + (qTotal ? ` · 拼图 ${qTotal} 个` : '')
       + ` · 待人工 ${manual.length} 项`;
 
@@ -218,6 +222,18 @@
           <div class="sub">${it.kind === 'search' ? '每日活动' : '引导/访问'} 任务</div>
         </div>
         <span class="pill ${it.ok ? 'ok' : 'failed'}">${it.ok ? '已自动完成' : '失败'}</span>
+      </div>`);
+    }
+    // 日常任务（赚取页 #moreactivities）
+    for (const dt of (dailyTasks ? dailyTasks.items || [] : [])) {
+      rows.push(`<div class="list-row">
+        <div class="grow">
+          <div class="title">${esc(dt.title)}${dt.points ? ` <span class="pill">+${dt.points}</span>` : ''}</div>
+          <div class="sub">日常任务 · ${
+            dt.kind === 'puzzle' ? '拼图' : dt.kind === 'edge' ? 'Edge 相关' : dt.kind === 'search' ? '搜索' : '互动'
+          }${dt.note ? ` · ${esc(dt.note)}` : ''}</div>
+        </div>
+        <span class="pill ${dt.ok ? 'ok' : 'failed'}">${dt.ok ? '已执行' : '失败'}</span>
       </div>`);
     }
     // 拼图任务（赚取页的 punchcard）
@@ -408,6 +424,7 @@
     const t = useGlobal ? Object.assign({}, global.tasks) : Object.assign({}, global.tasks, eff.tasks || {});
     $('tasks_enabled').checked = t.enabled !== false;
     $('tasks_dailySet').checked = t.doDailySet !== false;
+    $('tasks_dailyTasks').checked = t.doDailyTasks !== false;
     $('tasks_quests').checked = t.doQuests !== false;
     $('tasks_claim').checked = t.claimPoints !== false;
     $('tasks_visitEarn').checked = t.visitEarnPage !== false;
@@ -498,6 +515,7 @@
       tasks: {
         enabled: $('tasks_enabled').checked,
         doDailySet: $('tasks_dailySet').checked,
+        doDailyTasks: $('tasks_dailyTasks').checked,
         doQuests: $('tasks_quests').checked,
         claimPoints: $('tasks_claim').checked,
         visitEarnPage: $('tasks_visitEarn').checked,
@@ -710,6 +728,324 @@
     }).join('') : '<div class="muted">暂无记录</div>';
   }
   $('historyAll').addEventListener('change', loadHistory);
+
+  /* ================= 备份与恢复 ================= */
+
+  let backupCats = [];        // 服务端返回的类别元信息
+  let pickedCats = new Set(); // 已勾选的类别
+  let importPreview = null;   // 待恢复的备份预览
+  let backupInited = false;
+
+  const fmtSize = (bytes) => {
+    if (bytes == null) return '—';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1073741824) return `${(bytes / 1048576).toFixed(1)} MB`;
+    return `${(bytes / 1073741824).toFixed(2)} GB`;
+  };
+
+  /** 渲染类别勾选列表 */
+  function renderCats() {
+    const box = $('catList');
+    if (!backupCats.length) {
+      box.innerHTML = '<div class="muted">没有可备份的内容。</div>';
+      return;
+    }
+    box.innerHTML = backupCats.map((c) => {
+      const picked = pickedCats.has(c.cat);
+      return `<label class="cat-item${picked ? ' picked' : ''}${c.sensitive ? ' sensitive' : ''}" data-cat="${esc(c.cat)}">
+        <input type="checkbox" ${picked ? 'checked' : ''} data-cat="${esc(c.cat)}" />
+        <div class="cat-body">
+          <div class="cat-name">${esc(c.label)}
+            ${c.sensitive ? '<span class="pill warn">敏感 · 含登录 Cookie</span>' : ''}
+            ${c.fileCount ? '' : '<span class="pill">空</span>'}
+          </div>
+          <div class="cat-desc">${esc(c.desc)}</div>
+        </div>
+        <div class="cat-size">${c.fileCount} 文件<br/>${fmtSize(c.bytes)}</div>
+      </label>`;
+    }).join('');
+
+    // 汇总
+    const sel = backupCats.filter((c) => pickedCats.has(c.cat));
+    const totalBytes = sel.reduce((s, c) => s + c.bytes, 0);
+    const totalFiles = sel.reduce((s, c) => s + c.fileCount, 0);
+    $('catTotal').innerHTML = sel.length
+      ? `已选 <strong>${sel.length}</strong> 项 · 共 <strong>${totalFiles}</strong> 个文件 · 原始体积约 <strong>${fmtSize(totalBytes)}</strong>`
+        + (sel.some((c) => c.sensitive) ? ' · <span style="color:#e8b339">包含登录态，请妥善保管备份文件</span>' : '')
+      : '尚未选择任何内容';
+    $('btnExport').disabled = sel.length === 0;
+  }
+
+  $('catList').addEventListener('change', (e) => {
+    const cb = e.target.closest('input[type="checkbox"]');
+    if (!cb) return;
+    if (cb.checked) pickedCats.add(cb.dataset.cat);
+    else pickedCats.delete(cb.dataset.cat);
+    renderCats();
+  });
+
+  $('btnCatAll').addEventListener('click', () => {
+    pickedCats = new Set(backupCats.map((c) => c.cat));
+    renderCats();
+  });
+  $('btnCatNone').addEventListener('click', () => {
+    pickedCats = new Set();
+    renderCats();
+  });
+  $('btnCatSafe').addEventListener('click', () => {
+    pickedCats = new Set(backupCats.filter((c) => !c.sensitive).map((c) => c.cat));
+    renderCats();
+  });
+
+  /** 拉取可备份项统计 */
+  async function loadBackupCats() {
+    try {
+      const r = await api('/api/backup/scan');
+      if (!r.ok) return;
+      backupCats = r.data.categories;
+      if (!backupInited) {
+        // 默认勾选建议项：设置 + 历史 + 词库（不含登录态与日志）
+        pickedCats = new Set(backupCats.filter((c) => ['settings', 'history', 'queries'].includes(c.cat)).map((c) => c.cat));
+        backupInited = true;
+      }
+      renderCats();
+    } catch { /* 忽略 */ }
+  }
+
+  /** 列出已有备份 */
+  async function loadBackupList() {
+    const box = $('backupList');
+    try {
+      const r = await api('/api/backup/list');
+      if (!r.ok) { box.innerHTML = '<div class="muted">读取失败</div>'; return; }
+      $('backupDirTip').textContent = `存放位置：${r.data.dir}`;
+      if (!r.data.list.length) {
+        box.innerHTML = '<div class="muted">暂无备份。点上方「导出备份」创建第一个。</div>';
+        return;
+      }
+      box.innerHTML = r.data.list.map((f) => `
+        <div class="list-row">
+          <div class="grow">
+            <div class="title">${esc(f.name)}</div>
+            <div class="sub">${fmtSize(f.size)} · ${fmtDate(f.mtime)}</div>
+          </div>
+          <button class="btn sm" data-bk="download" data-name="${esc(f.name)}">下载</button>
+          <button class="btn sm" data-bk="restore" data-name="${esc(f.name)}">恢复</button>
+          <button class="btn sm ghost" data-bk="delete" data-name="${esc(f.name)}" style="color:#ef5b5b">删除</button>
+        </div>`).join('');
+    } catch {
+      box.innerHTML = '<div class="muted">读取失败</div>';
+    }
+  }
+
+  $('backupList').addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-bk]');
+    if (!btn) return;
+    const { bk, name } = btn.dataset;
+
+    if (bk === 'download') {
+      window.location.href = `/api/backup/download?name=${encodeURIComponent(name)}`;
+      return;
+    }
+    if (bk === 'delete') {
+      if (!confirm(`确定删除备份「${name}」？此操作不可撤销。`)) return;
+      await api('/api/backup/delete', { method: 'POST', body: JSON.stringify({ name }) });
+      toast('已删除', 'ok');
+      loadBackupList();
+      return;
+    }
+    if (bk === 'restore') {
+      // 直接进入恢复确认（用已有备份的预览）
+      const r = await api('/api/backup/scan'); void r;
+      showRestorePanel(name, null);
+      return;
+    }
+  });
+
+  $('btnRefreshBackups').addEventListener('click', loadBackupList);
+
+  /** 导出（异步任务 + 进度轮询） */
+  $('btnExport').addEventListener('click', async () => {
+    const cats = [...pickedCats];
+    if (!cats.length) { toast('请先选择要备份的内容', 'err'); return; }
+    const name = $('backupName').value.trim();
+    const btn = $('btnExport');
+    btn.disabled = true;
+
+    try {
+      const r = await api('/api/backup/export', {
+        method: 'POST',
+        body: JSON.stringify({ cats, name: name || undefined }),
+      });
+      if (!r.ok) { toast('导出失败：' + (r.error || ''), 'err'); btn.disabled = false; return; }
+
+      const taskId = r.data.taskId;
+      toast('已开始打包，进度见下方提示', 'ok');
+
+      // 轮询进度
+      let last = null;
+      for (let i = 0; i < 3600; i++) {          // 最长约 1 小时（大备份可能很久）
+        await new Promise((res) => setTimeout(res, 1000));
+        const pr = await api('/api/backup/progress?task=' + encodeURIComponent(taskId)).catch(() => null);
+        if (!pr || !pr.ok) break;
+        const t = pr.data;
+        last = t;
+        if (t.state === 'running') {
+          const pct = t.total ? Math.floor((t.done / t.total) * 100) : 0;
+          btn.textContent = t.total ? `打包中 ${pct}%` : '打包中…';
+          $('catTotal').innerHTML = t.total
+            ? `正在打包 <strong>${t.done}</strong> / <strong>${t.total}</strong> 个文件（${pct}%）…`
+            : '正在统计文件…';
+        }
+        if (t.state === 'done') {
+          btn.textContent = '导出备份';
+          btn.disabled = false;
+          toast(`已导出 ${t.name}（${fmtSize(t.size)}）`, 'ok');
+          $('backupName').value = '';
+          loadBackupList();
+          loadBackupCats();
+          window.location.href = `/api/backup/download?name=${encodeURIComponent(t.name)}`;
+          return;
+        }
+        if (t.state === 'failed') {
+          toast('导出失败：' + (t.error || ''), 'err');
+          break;
+        }
+      }
+      btn.textContent = '导出备份';
+      btn.disabled = false;
+      renderCats();
+      if (last && last.state === 'running') toast('打包仍在后台进行，可稍后到「已有备份」查看', '');
+    } catch (err) {
+      toast('导出失败：' + err.message, 'err');
+      btn.disabled = false;
+      btn.textContent = '导出备份';
+    }
+  });
+
+  /* ---- 导入 ---- */
+  $('btnPickImport').addEventListener('click', () => $('importFile').click());
+
+  $('importFile').addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!/\.zip$/i.test(file.name)) { toast('请选择 .zip 备份文件', 'err'); return; }
+
+    const btn = $('btnPickImport');
+    btn.disabled = true;
+    btn.textContent = '上传中…';
+    try {
+      const buf = await file.arrayBuffer();
+      const res = await fetch(`/api/backup/upload?name=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/zip' },
+        body: buf,
+      });
+      const j = await res.json();
+      if (!j.ok) { toast('导入失败：' + (j.error || ''), 'err'); return; }
+      loadBackupList();
+      showRestorePanel(j.data.name, j.data.preview);
+    } catch (err) {
+      toast('上传失败：' + err.message, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '导入备份…';
+    }
+  });
+
+  /** 显示恢复面板 */
+  function showRestorePanel(name, preview) {
+    importPreview = { name, preview };
+    const panel = $('importPanel');
+    panel.hidden = false;
+
+    const cats = (preview && preview.manifest && preview.manifest.categories) || [];
+    const counts = (preview && preview.counts) || {};
+
+    $('importPreview').innerHTML = preview ? `
+      <div class="list-row">
+        <div class="grow">
+          <div class="title">${esc(name)}</div>
+          <div class="sub">创建于 ${esc(preview.manifest.createdAt || '未知')} ·
+            程序版本 ${esc(String(preview.manifest.appVersion || '?'))} ·
+            包含 ${preview.manifest.entryCount} 个文件（${fmtSize(preview.manifest.totalBytes)}）</div>
+          <div class="sub">原账号：${esc((preview.manifest.accounts || []).map((a) => a.label || a.id).join('、') || '无')}</div>
+        </div>
+      </div>` : `<div class="muted">将恢复备份「${esc(name)}」（未读取到预览信息，将按其中实际内容处理）</div>`;
+
+    // 只允许恢复备份中确实包含的类别
+    const available = cats.length ? cats : backupCats.map((c) => c.cat);
+    $('importCats').innerHTML = available.map((cat) => {
+      const meta = backupCats.find((c) => c.cat === cat) || { label: cat, desc: '', sensitive: false };
+      return `<label class="switch">
+        <input type="checkbox" data-icat="${esc(cat)}" checked />
+        <span></span>${esc(meta.label)}${counts[cat] ? `（${counts[cat]}）` : ''}${meta.sensitive ? ' ⚠' : ''}
+      </label>`;
+    }).join('') || '<span class="muted">该备份不含可恢复内容</span>';
+
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  $('btnCancelImport').addEventListener('click', () => {
+    $('importPanel').hidden = true;
+    importPreview = null;
+  });
+
+  $('btnRestore').addEventListener('click', async () => {
+    if (!importPreview || !importPreview.name) { toast('请先选择备份文件', 'err'); return; }
+    const mode = $('importMode').value;
+    const cats = [...$('importCats').querySelectorAll('input[data-icat]:checked')].map((i) => i.dataset.icat);
+    if (!cats.length) { toast('请至少选择一项要恢复的内容', 'err'); return; }
+
+    const warn = mode === 'overwrite'
+      ? `将以「覆盖」方式恢复：\n\n选择的内容会用备份中的数据完整替换，本地同名数据会被覆盖。\n\n确定继续？`
+      : `将以「合并」方式恢复：\n\n保留本地数据，补充备份中的内容，不会删除任何东西。\n\n确定继续？`;
+    if (!confirm(warn)) return;
+
+    const btn = $('btnRestore');
+    btn.disabled = true;
+    btn.textContent = '恢复中…';
+    // 大备份恢复可能耗时较久（登录态可达数百 MB），先给个进度提示
+    const t0 = Date.now();
+    const ticker = setInterval(() => {
+      const secs = Math.round((Date.now() - t0) / 1000);
+      btn.textContent = `恢复中… ${secs}s`;
+    }, 1000);
+    try {
+      const r = await api('/api/backup/restore', {
+        method: 'POST',
+        body: JSON.stringify({ name: importPreview.name, mode, cats }),
+      });
+      if (!r.ok) { toast('恢复失败：' + (r.error || ''), 'err'); return; }
+      const a = r.data.applied;
+      const parts = [];
+      if (a.settings) parts.push('设置');
+      if (a.history) parts.push(`历史(${a.history})`);
+      if (a.queries) parts.push(`词库(${a.queries})`);
+      if (a.screenshots) parts.push(`截图(${a.screenshots})`);
+      if (a.logs) parts.push(`日志(${a.logs})`);
+      if (a.profiles) parts.push(`登录态(${a.profiles})`);
+      toast(`恢复完成：${parts.join('、') || '无变更'}`, 'ok');
+      $('importPanel').hidden = true;
+      importPreview = null;
+      await refresh();
+      loadBackupCats();
+    } catch (err) {
+      toast('恢复失败：' + err.message, 'err');
+    } finally {
+      clearInterval(ticker);
+      btn.disabled = false;
+      btn.textContent = '开始恢复';
+    }
+  });
+
+  /** 进入备份页时刷新 */
+  async function refreshBackupView() {
+    await loadBackupCats();
+    await loadBackupList();
+  }
 
   /* ---------------- 日志 ---------------- */
   const logBox = $('logBox');
