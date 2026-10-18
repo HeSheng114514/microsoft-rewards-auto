@@ -9,6 +9,7 @@
  *   cn.bing.com 页头 #id_rh_w / #rh_rwm    -> 实时积分（旧版为 #id_rc）
  */
 import { log } from './logger.js';
+import { safeGoto } from './net.js';
 
 const DASHBOARD = 'https://rewards.bing.com/dashboard';
 const EARN = 'https://rewards.bing.com/earn';
@@ -29,7 +30,7 @@ function toNumSafe(v) {
  */
 export async function dashboardPoints(page) {
   try {
-    await page.goto(DASHBOARD, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await safeGoto(page, DASHBOARD, { timeout: 60000 });
     await page.waitForTimeout(3500);
     const txt = await page.evaluate(() => {
       const clean = (el) => (el ? (el.innerText || '').replace(/\s+/g, ' ').trim() : '');
@@ -128,7 +129,7 @@ export async function bingPoints(page) {
  * @returns {Promise<object>}
  */
 export async function inspect(page) {
-  await page.goto(DASHBOARD, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await safeGoto(page, DASHBOARD, { timeout: 60000 });
   // 新版是 React 流式渲染，需要等卡片挂载完成
   await page.waitForFunction(
     () => !!document.querySelector('#streaks') || !!document.querySelector('#dailyset'),
@@ -388,7 +389,7 @@ export function analyzeQuota(info) {
 
 /** 打开积分赚取页，触发任务列表刷新，并返回未完成的搜索类任务 */
 export async function fetchEarnTasks(page) {
-  await page.goto(EARN, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await safeGoto(page, EARN, { timeout: 60000 });
   await page.waitForTimeout(4000);
   const tasks = await page.evaluate(() => {
     const txt = (el) => (el ? (el.innerText || '').replace(/\s+/g, ' ').trim() : '');
@@ -436,7 +437,7 @@ const TEXT_HELPER = `
  * 且带每日解锁门（完成一格后需等 24 小时才能推进下一格）。
  */
 export async function fetchQuests(page) {
-  await page.goto(EARN, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await safeGoto(page, EARN, { timeout: 60000 });
   await page.waitForTimeout(6000);
 
   const quests = await page.evaluate(new Function(`
@@ -501,13 +502,82 @@ export async function fetchQuests(page) {
 }
 
 /**
+ * 采集积分赚取页（/earn）上的「日常任务」区块（#moreactivities）
+ *
+ * 这个区块**只存在于 /earn 页**，仪表盘上完全没有，因此早期只抓仪表盘时被整体漏掉。
+ * 实测每个任务卡都是指向站外的普通链接（bing.com/search、spotlight 拼图、Edge 欢迎页等），
+ * **必须点击卡片**才会被计入（实测：点击后计数 0/185 → 15/185、积分 +42）。
+ *
+ * 任务分两类：
+ *   search  搜索/问答类（bing.com/search?q=…）—— 点击打开即计分
+ *   action  交互类（拼图 imagepuzzle、Edge 欢迎页等）—— 点击打开即计分
+ *   referral 邀请好友 —— 不可自动完成，跳过
+ */
+export async function fetchDailyTasks(page) {
+  await safeGoto(page, EARN, { timeout: 60000 });
+  await page.waitForTimeout(7000);
+
+  const data = await page.evaluate(new Function(`
+    ${TEXT_HELPER}
+    const box = document.querySelector('#moreactivities');
+    if (!box) return { found: false, tasks: [], counter: null };
+
+    const head = txt(box);
+    const cm = head.match(/日常任务\\s*([\\d,]+)\\s*\\/\\s*([\\d,]+)/);
+
+    const seen = new Set();
+    const tasks = [];
+    for (const a of box.querySelectorAll('a[href]')) {
+      const href = a.href || '';
+      if (!href || seen.has(href)) continue;
+      seen.add(href);
+
+      // 卡片容器：向上找到含标题的最小块
+      let card = a;
+      let t = txt(a);
+      for (let i = 0; i < 3 && t.length < 20 && card.parentElement; i++) {
+        card = card.parentElement;
+        t = txt(card);
+      }
+
+      // 标题：链接内的首个短文本，否则用整段开头
+      let title = txt(a.querySelector('p, span, h3, h4'));
+      if (!title) title = t.slice(0, 40);
+
+      const cardText = txt(card) || t;
+      // 邀请好友类无法自动完成
+      const isReferral = /referandearn|邀请好友|将推荐转化为奖励|分享邀请/i.test(href) || /真正的朋友|邀请好友/.test(title);
+
+      let kind = 'action';
+      if (isReferral) kind = 'referral';
+      else if (/bing\\.com\\/search/i.test(href)) kind = 'search';
+      else if (/spotlight\\/imagepuzzle/i.test(href)) kind = 'puzzle';
+      else if (/microsoftedgewelcome|microsoft\\.com\\/edge/i.test(href)) kind = 'edge';
+
+      tasks.push({
+        origin: 'daily',
+        href,
+        title: String(title).slice(0, 60),
+        text: cardText.slice(0, 180),
+        points: (() => { const m = cardText.match(/\\+\\s*([\\d,]+)/); return m ? Number(m[1].replace(/,/g, '')) : null; })(),
+        done: /已完成/.test(cardText),
+        kind,
+      });
+    }
+    return { found: true, counter: cm ? cm[1] + '/' + cm[2] : null, tasks };
+  `));
+
+  return data;
+}
+
+/**
  * 解析拼图任务详情页：
  *   - 当前进度（状态: X/Y 个任务）
  *   - 可点击的 CTA（**只在当前可推进的那一格上渲染**）
  *   - 是否属于必须用桌面 App 才能完成的任务
  */
 export async function inspectQuest(page, questUrl) {
-  await page.goto(questUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await safeGoto(page, questUrl, { timeout: 60000 });
   await page.waitForTimeout(6000);
 
   return await page.evaluate(new Function(`

@@ -17,8 +17,38 @@ import { startScheduler, stopScheduler, schedulerStatus, refreshNextRun, compute
 import { listBrowsers, guideLogin, closeBrowser, isBrowserOpen, signOut } from './browser.js';
 import { inspect } from './rewards.js';
 import { launchBrowser, getPage } from './browser.js';
+import {
+  scanBackup, exportBackup, inspectBackup, importBackup, backupDir,
+} from './backup.js';
+
+/** 备份文件名安全化：只允许字母数字、点、横线、下划线、中文 */
+function sanitizeBackupName(name) {
+  const s = String(name || '').trim();
+  if (!s) return null;
+  // 直接拒绝任何路径成分（而不是净化后接受），语义更明确
+  if (/[\\/]/.test(s)) return null;
+  if (s.includes('..')) return null;
+  if (!/^[\w\u4e00-\u9fa5.\-]+$/.test(s)) return null;
+  if (!s.toLowerCase().endsWith('.zip')) return null;
+  if (s.length > 120) return null;
+  return s;
+}
+
+function defaultBackupName() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `rewards-backup-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}.zip`;
+}
+
+function defaultUploadName() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `uploaded-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.zip`;
+}
 
 const sseClients = new Set();
+/** 备份导出任务表（大备份异步执行，避免请求超时） */
+const backupTasks = new Map();
 
 function broadcast(event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -50,6 +80,30 @@ async function readBody(req) {
       if (!data) return resolve({});
       try { resolve(JSON.parse(data)); } catch { reject(new Error('JSON 解析失败')); }
     });
+    req.on('error', reject);
+  });
+}
+
+/**
+ * 读取原始请求体（二进制），用于备份文件上传
+ * @param {import('node:http').IncomingMessage} req
+ * @param {number} [maxBytes]
+ * @returns {Promise<Buffer>}
+ */
+function readRawBody(req, maxBytes = 512 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > maxBytes) {
+        reject(new Error(`文件过大（超过 ${Math.round(maxBytes / 1048576)} MB）`));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -152,6 +206,16 @@ export function createServer() {
       }
       if (req.method === 'GET' && p === '/app.js') {
         return serveStatic(res, path.join(WEB_DIR, 'app.js'), 'application/javascript');
+      }
+      if (req.method === 'GET' && p === '/favicon.ico') {
+        const ico = path.join(WEB_DIR, 'favicon.ico');
+        if (fs.existsSync(ico)) {
+          const buf = fs.readFileSync(ico);
+          res.writeHead(200, { 'Content-Type': 'image/x-icon', 'Content-Length': buf.length, 'Cache-Control': 'max-age=86400' });
+          return res.end(buf);
+        }
+        res.writeHead(204);
+        return res.end();
       }
 
       /* ---------------- SSE ---------------- */
@@ -382,6 +446,157 @@ export function createServer() {
           }
         })();
         return json(res, 200, { ok: true, message: '正在刷新' });
+      }
+
+      /* ---------------- 备份与恢复 ---------------- */
+      if (p === '/api/backup/scan' && req.method === 'GET') {
+        const cats = (url.searchParams.get('cats') || '').split(',').map((s) => s.trim()).filter(Boolean);
+        const data = scanBackup(cats.length ? cats : null);
+        return json(res, 200, { ok: true, data });
+      }
+
+      // 导出备份（服务器侧打包，完成后返回下载地址）
+      if (p === '/api/backup/export' && req.method === 'POST') {
+        const body = await readBody(req);
+        const cats = Array.isArray(body.cats) ? body.cats : [];
+        if (!cats.length) return json(res, 400, { ok: false, error: '请至少选择一项备份内容' });
+        try {
+          const name = sanitizeBackupName(body.name) || defaultBackupName();
+          const file = path.join(backupDir(), name);
+
+          // 异步执行，立刻返回任务 id，避免大备份（可达数百 MB）把请求拖超时
+          const taskId = `bk-${Date.now()}`;
+          backupTasks.set(taskId, { id: taskId, state: 'running', stage: 'starting', done: 0, total: 0, startedAt: new Date().toISOString() });
+          broadcast('backup-progress', backupTasks.get(taskId));
+
+          (async () => {
+            const t = backupTasks.get(taskId);
+            try {
+              const r = await exportBackup(file, cats, (prog) => {
+                Object.assign(t, {
+                  stage: prog.stage,
+                  done: prog.done || 0,
+                  total: prog.total || 0,
+                  current: prog.current || '',
+                });
+                broadcast('backup-progress', { ...t });
+              });
+              Object.assign(t, {
+                state: 'done',
+                stage: 'done',
+                name: path.basename(r.file),
+                size: r.size,
+                manifest: r.manifest,
+                finishedAt: new Date().toISOString(),
+              });
+            } catch (err) {
+              Object.assign(t, { state: 'failed', error: err.message, finishedAt: new Date().toISOString() });
+              log.error('导出备份失败：' + err.message);
+            }
+            broadcast('backup-progress', { ...t });
+            // 5 分钟后清理任务记录
+            setTimeout(() => backupTasks.delete(taskId), 5 * 60_000);
+          })();
+
+          return json(res, 200, { ok: true, data: { taskId, name } });
+        } catch (err) {
+          log.error('导出备份失败：' + err.message);
+          return json(res, 500, { ok: false, error: err.message });
+        }
+      }
+
+      // 查询导出进度
+      if (p === '/api/backup/progress' && req.method === 'GET') {
+        const id = url.searchParams.get('task');
+        const t = backupTasks.get(id);
+        if (!t) return json(res, 404, { ok: false, error: '任务不存在或已过期' });
+        return json(res, 200, { ok: true, data: t });
+      }
+
+      // 下载已生成的备份
+      if (p === '/api/backup/download' && req.method === 'GET') {
+        const name = sanitizeBackupName(url.searchParams.get('name'));
+        if (!name) return json(res, 400, { ok: false, error: '文件名非法' });
+        const file = path.join(backupDir(), name);
+        if (!fs.existsSync(file)) return json(res, 404, { ok: false, error: '文件不存在' });
+        const buf = fs.readFileSync(file);
+        res.writeHead(200, {
+          'Content-Type': 'application/zip',
+          'Content-Disposition': `attachment; filename="${encodeURIComponent(name)}"`,
+          'Content-Length': buf.length,
+          'Cache-Control': 'no-store',
+        });
+        return res.end(buf);
+      }
+
+      // 列出已有备份
+      if (p === '/api/backup/list' && req.method === 'GET') {
+        const dir = backupDir();
+        const list = fs.readdirSync(dir)
+          .filter((f) => f.endsWith('.zip'))
+          .map((f) => {
+            const full = path.join(dir, f);
+            const st = fs.statSync(full);
+            return { name: f, size: st.size, mtime: st.mtime.toISOString() };
+          })
+          .sort((a, b) => new Date(b.mtime) - new Date(a.mtime));
+        return json(res, 200, { ok: true, data: { dir, list } });
+      }
+
+      // 删除某个备份
+      if (p === '/api/backup/delete' && req.method === 'POST') {
+        const body = await readBody(req);
+        const name = sanitizeBackupName(body.name);
+        if (!name) return json(res, 400, { ok: false, error: '文件名非法' });
+        const file = path.join(backupDir(), name);
+        if (fs.existsSync(file)) {
+          fs.unlinkSync(file);
+          log.info(`已删除备份 ${name}`);
+        }
+        return json(res, 200, { ok: true });
+      }
+
+      // 上传备份文件（二进制），校验后返回预览
+      if (p === '/api/backup/upload' && req.method === 'POST') {
+        const name = sanitizeBackupName(url.searchParams.get('name')) || defaultUploadName();
+        const buf = await readRawBody(req);
+        if (!buf.length) return json(res, 400, { ok: false, error: '上传内容为空' });
+        if (!(buf[0] === 0x50 && buf[1] === 0x4b)) {
+          return json(res, 400, { ok: false, error: '不是有效的 ZIP 文件' });
+        }
+        const file = path.join(backupDir(), name);
+        fs.writeFileSync(file, buf);
+        try {
+          const prev = await inspectBackup(file);
+          log.info(`已接收备份文件 ${name}（${(buf.length / 1024).toFixed(1)} KB）`);
+          return json(res, 200, { ok: true, data: { name, size: buf.length, preview: prev } });
+        } catch (err) {
+          fs.rmSync(file, { force: true });
+          log.warn('上传的备份文件校验失败：' + err.message);
+          return json(res, 400, { ok: false, error: err.message });
+        }
+      }
+
+      // 从备份恢复
+      if (p === '/api/backup/restore' && req.method === 'POST') {
+        if (isRunning()) return json(res, 200, { ok: false, error: '任务执行中，请稍后再恢复' });
+        const body = await readBody(req);
+        const name = sanitizeBackupName(body.name);
+        if (!name) return json(res, 400, { ok: false, error: '请指定备份文件' });
+        const file = path.join(backupDir(), name);
+        if (!fs.existsSync(file)) return json(res, 404, { ok: false, error: '备份文件不存在' });
+
+        try {
+          const r = await importBackup(file, {
+            mode: body.mode === 'overwrite' ? 'overwrite' : 'merge',
+            cats: Array.isArray(body.cats) ? body.cats : undefined,
+          });
+          broadcast('status', buildStatus());
+          return json(res, 200, { ok: true, data: r });
+        } catch (err) {
+          log.error('恢复备份失败：' + err.message);
+          return json(res, 500, { ok: false, error: err.message });
+        }
       }
 
       /* ---------------- 托盘 ---------------- */

@@ -6,12 +6,119 @@
  * 早期只解析 #dailyset，导致这些任务被整体漏掉。
  */
 import { log } from './logger.js';
+import { safeGoto } from './net.js';
 import {
-  inspect, analyzeQuota, fetchEarnTasks, collectTasks, fetchQuests, inspectQuest, DASHBOARD, EARN,
+  inspect, analyzeQuota, fetchEarnTasks, collectTasks, fetchQuests, inspectQuest,
+  fetchDailyTasks, DASHBOARD, EARN,
 } from './rewards.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
+
+/**
+ * 执行「日常任务」区块（/earn 页 #moreactivities）
+ *
+ * 这类任务**只存在于 /earn 页**（仪表盘看不到），每个任务卡是站外链接，
+ * **必须点击卡片**才计分（实测：点击后计数 0/185 → 15/185、积分 +42）。
+ *
+ * 与拼图任务的区别：这是「一天内可做完」的清单，通常能一次跑完，
+ * 积分 +5 ~ +100 即时到账。
+ */
+export async function doDailyTasks(page, cfg) {
+  const result = { counter: null, total: 0, clicked: 0, skipped: [], items: [], remaining: null };
+
+  let data;
+  try {
+    data = await fetchDailyTasks(page);
+  } catch (err) {
+    log.warn('读取日常任务失败：', err.message);
+    return result;
+  }
+
+  if (!data.found) {
+    log.info('日常任务：未找到该区块（可能该账号不适用）。');
+    return result;
+  }
+
+  result.counter = data.counter;
+  const pending = (data.tasks || []).filter((t) => !t.done);
+  result.total = pending.length;
+
+  if (!pending.length) {
+    log.info(`日常任务：全部已完成（${data.counter || '—'}）。`);
+    return result;
+  }
+
+  log.info(`日常任务 ${data.counter || ''}：发现 ${pending.length} 项待完成。`);
+  for (const t of pending) {
+    log.info(`   · ${t.title}${t.points ? ` +${t.points}` : ''}  [${t.kind}]`);
+  }
+
+  for (const task of pending) {
+    if (task.kind === 'referral') {
+      result.skipped.push({ title: task.title, points: task.points, href: task.href, reason: '需你本人邀请好友' });
+      log.info(`跳过「${task.title}」：邀请好友类，需你本人操作。`);
+      continue;
+    }
+
+    log.step(`日常任务：「${task.title}」${task.points ? ` +${task.points}` : ''}`);
+    try {
+      // 每次点击前回到 /earn，保证元素是最新渲染状态
+      await safeGoto(page, EARN, { timeout: 60000 });
+      await sleep(rand(2000, 3500));
+
+      const handle = await page.evaluateHandle((href) => {
+        return [...document.querySelectorAll('#moreactivities a[href]')].find((a) => a.href === href) || null;
+      }, task.href);
+      const el = handle.asElement();
+      if (!el) {
+        log.info('    该卡片已不在页面上（可能已完成），跳过。');
+        continue;
+      }
+
+      const popupPromise = page.context().waitForEvent('page', { timeout: 15000 }).catch(() => null);
+      await el.click().catch(() => {});
+      const popup = await popupPromise;
+
+      if (popup) {
+        await popup.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+        await sleep(rand(4000, 6500));
+        await popup.mouse.wheel(0, rand(300, 900)).catch(() => {});
+        await sleep(rand(1500, 3000));
+        await popup.close().catch(() => {});
+      } else {
+        await sleep(rand(3500, 5500));
+        await page.mouse.wheel(0, rand(300, 800)).catch(() => {});
+      }
+
+      result.clicked += 1;
+      result.items.push({ title: task.title, points: task.points, kind: task.kind, ok: true });
+    } catch (err) {
+      log.warn(`    执行失败：${err.message}`);
+      result.items.push({ title: task.title, points: task.points, kind: task.kind, ok: false, note: err.message });
+    }
+    await sleep(rand(1200, 2600));
+  }
+
+  // 复核计数
+  try {
+    await sleep(2500);
+    const after = await fetchDailyTasks(page);
+    result.counterAfter = after.counter;
+    const stillPending = (after.tasks || []).filter((t) => !t.done && t.kind !== 'referral');
+    result.remaining = stillPending.length;
+    for (const t of stillPending) {
+      result.skipped.push({ title: t.title, points: t.points, href: t.href, reason: '本次点击后仍未完成' });
+    }
+    if (after.counter && after.counter !== data.counter) {
+      log.success(`日常任务计数推进：${data.counter} → ${after.counter}`);
+    } else if (result.clicked) {
+      log.info(`已点击 ${result.clicked} 项，计数为 ${after.counter || '—'}（入账可能有延迟）。`);
+    }
+  } catch { /* 复核失败不影响主流程 */ }
+
+  return result;
+}
 
 /**
  * 执行「拼图任务」（/earn 页 #quests 里的 punchcard）
@@ -196,7 +303,7 @@ export async function doAllDashboardTasks(page, cfg) {
    * 直接 page.goto 到目标 URL 时，服务端的归属判定可能不认，导致任务不记积分。
    */
   const clickOnDashboard = async (task) => {
-    await page.goto(DASHBOARD, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await safeGoto(page, DASHBOARD, { timeout: 60000 });
     await sleep(rand(2000, 3500));
 
     // 定位到对应卡片（优先用 URL 中的 offerId 特征，其次用标题文本）
@@ -419,7 +526,7 @@ export async function doQuizzes(page) {
 /** 读取奖励仪表盘的可用积分（领取校验用） */
 async function dashboardPoints(page) {
   try {
-    await page.goto(DASHBOARD, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await safeGoto(page, DASHBOARD, { timeout: 60000 });
     await page.waitForTimeout(3500);
     const v = await page.evaluate(() => {
       const txt = (el) => (el ? (el.innerText || '').replace(/\s+/g, ' ').trim() : '');
@@ -442,7 +549,7 @@ async function dashboardPoints(page) {
 export async function claimPoints(page) {
   const result = { claimed: false, amount: null, message: '', pointsBefore: null, pointsAfter: null };
   try {
-    await page.goto(DASHBOARD, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await safeGoto(page, DASHBOARD, { timeout: 60000 });
     await page.waitForTimeout(4000);
 
     const claimCard = await page.evaluate(() => {
@@ -549,7 +656,7 @@ export async function claimPoints(page) {
 export async function checkMobileApp(page, cfg) {
   const result = { applicable: true, done: null, total: null, remaining: null, canAutoDo: false, message: '' };
   try {
-    await page.goto(DASHBOARD, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await safeGoto(page, DASHBOARD, { timeout: 60000 });
     await page.waitForTimeout(4000);
 
     const card = await page.evaluate(() => {
@@ -594,7 +701,7 @@ export async function checkMobileApp(page, cfg) {
 /** 访问积分赚取页，触发服务端任务刷新（略带浏览行为） */
 export async function visitEarn(page) {
   try {
-    await page.goto(EARN, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await safeGoto(page, EARN, { timeout: 60000 });
     await page.waitForTimeout(rand(2500, 5000));
     await page.mouse.wheel(0, rand(400, 1000)).catch(() => {});
     await page.waitForTimeout(rand(1000, 2500));
