@@ -209,6 +209,46 @@ export async function safeGoto(page, url, opts = {}) {
 export const FAST_FAIL_TIMEOUT_MS = 15000;
 
 /**
+ * 等待页面渲染出内容（比固定 sleep 更稳，也更省时间）
+ *
+ * 背景：Rewards 是 React 流式渲染，`domcontentloaded` 触发时往往还是空壳。
+ * 早期到处用 `waitForTimeout(7000)` 硬等 —— 慢机器不够用、快机器白等，
+ * 表现为「有时行有时不行」。
+ *
+ * 注意：只判断「容器存在」往往不够。实测导航刚完成时区块容器已在，
+ * 但内部还没填充子元素（`#moreactivities` 存在却没有 `a[href]`）。
+ * 因此用 `count` 指定必须出现的元素个数，轮询到足够数量才算就绪。
+ *
+ * @param {import('playwright-core').Page} page
+ * @param {{selector?:string, minCount?:number, minText?:number, timeout?:number, pollMs?:number}} [opts]
+ * @returns {Promise<boolean>} 是否在超时前满足条件
+ */
+export async function waitForContent(page, opts = {}) {
+  const selector = opts.selector || '';
+  const minCount = Number(opts.minCount ?? 1);
+  const minText = Number(opts.minText ?? 0);
+  const timeout = Math.max(1000, Number(opts.timeout ?? 20000));
+  const pollMs = Math.max(100, Number(opts.pollMs ?? 400));
+  const deadline = Date.now() + timeout;
+
+  while (Date.now() < deadline) {
+    try {
+      if (selector) {
+        const n = await page.locator(selector).count();
+        if (n >= minCount) return true;
+      }
+      if (minText > 0) {
+        const len = await page.evaluate(() => (document.body?.innerText || '').trim().length).catch(() => 0);
+        if (len >= minText) return true;
+      }
+      if (!selector && minText <= 0) return true;   // 无条件即立刻通过
+    } catch { /* 页面可能正在导航，重试 */ }
+    await page.waitForTimeout(pollMs).catch(() => {});
+  }
+  return false;
+}
+
+/**
  * 网络连通性预检：尝试打开 Rewards 仪表盘
  *
  * 目的：断网时在**最开始**就给出明确结论，而不是让每个阶段各等一次 60 秒超时。

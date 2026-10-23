@@ -9,7 +9,7 @@
  *   cn.bing.com 页头 #id_rh_w / #rh_rwm    -> 实时积分（旧版为 #id_rc）
  */
 import { log } from './logger.js';
-import { safeGoto } from './net.js';
+import { safeGoto, waitForContent } from './net.js';
 
 const DASHBOARD = 'https://rewards.bing.com/dashboard';
 const EARN = 'https://rewards.bing.com/earn';
@@ -62,17 +62,75 @@ export async function dashboardAccountName(page) {
 }
 
 /**
- * 校验必应页头会话是否与 Rewards 账号一致。
- * 不一致意味着「必应会话还停在别的账号上」，此时按页头积分判断会完全跑偏。
+ * 读取必应页头当前显示的**账号身份标识**（用于判断页头是否属于本账号）
+ *
+ * 为什么需要它：实测发现同一个浏览器配置里，必应页头可能显示**另一个账号**的
+ * 昵称与积分（本账号「个 给 / 2234」，页头却显示「生 / 5489」）。
+ * 只比积分数值可能恰好接近而误判，直接比昵称更可靠。
+ *
+ * @returns {Promise<string|null>} 页头昵称，读不到返回 null
  */
-export async function checkSessionMatch(page, dashboardValue) {
-  const headerValue = await bingPoints(page);
-  const mismatch = homeValueMismatch(headerValue, dashboardValue);
-  return { headerValue, dashboardValue, match: !mismatch };
+export async function bingHeaderIdentity(page) {
+  try {
+    return await page.evaluate(() => {
+      const sels = ['#id_h [aria-label]', '#id_rh_w [aria-label]', '#id_n', '.id_avatar [aria-label]'];
+      for (const sel of sels) {
+        const el = document.querySelector(sel);
+        const v = (el?.getAttribute?.('aria-label') || el?.textContent || '').trim();
+        if (v && v.length <= 30 && !/^(登录|Sign in|查看个人资料|账户|Account|设置和快速链接)$/i.test(v)) return v;
+      }
+      return null;
+    });
+  } catch {
+    return null;
+  }
 }
 
 /**
- * 两个读数是否互相矛盾（据此判断「必应会话停在别的账号」）。
+ * 判定页头是否属于本账号。
+ * 优先比昵称（最可靠），积分数值仅作兜底。
+ *
+ * @param {{headerPoints?:number|null, headerName?:string|null, dashPoints?:number|null, dashName?:string|null}} v
+ * @returns {{mismatch:boolean, reason:string}}
+ */
+export function evaluateSessionMatch(v) {
+  const { headerPoints, headerName, dashPoints, dashName } = v;
+
+  // 1) 昵称对比（取较短者做包含判断：页头常只显示名，Rewards 显示「名 姓」）
+  if (headerName && dashName) {
+    const norm = (s) => String(s).replace(/\s+/g, '').toLowerCase();
+    const hn = norm(headerName);
+    const dn = norm(dashName);
+    const a = hn.length <= dn.length ? hn : dn;
+    const b = a === hn ? dn : hn;
+    if (a && b && !b.includes(a)) {
+      return { mismatch: true, reason: `昵称不一致（页头「${headerName}」vs 账号「${dashName}」）` };
+    }
+  }
+
+  // 2) 积分对比兜底
+  if (homeValueMismatch(headerPoints, dashPoints)) {
+    return { mismatch: true, reason: `积分差距过大（页头 ${headerPoints} vs 账号 ${dashPoints}）` };
+  }
+
+  return { mismatch: false, reason: '' };
+}
+
+/**
+ * 校验必应页头会话是否与 Rewards 账号一致。
+ * 不一致意味着「必应会话还停在别的账号上」，此时按页头积分判断会完全跑偏。
+ */
+export async function checkSessionMatch(page, dashboardValue, dashboardName = null) {
+  const headerValue = await bingPoints(page);
+  const headerName = await bingHeaderIdentity(page);
+  const r = evaluateSessionMatch({
+    headerPoints: headerValue, headerName, dashPoints: dashboardValue, dashName: dashboardName,
+  });
+  return { headerValue, headerName, dashboardValue, dashboardName, match: !r.mismatch, reason: r.reason };
+}
+
+/**
+ * 两个积分读数是否互相矛盾（据此判断「必应会话停在别的账号」）。
  *
  * 阈值不能太小：同账号的两个界面入账有几分钟延迟，积分不同步是常态
  * （实测曾出现页头 152 / 仪表盘 155）。因此采用「绝对 + 相对」双阈值。
@@ -438,10 +496,18 @@ const TEXT_HELPER = `
  */
 export async function fetchQuests(page) {
   await safeGoto(page, EARN, { timeout: 60000 });
-  await page.waitForTimeout(6000);
 
-  const quests = await page.evaluate(new Function(`
-    ${TEXT_HELPER}
+  /*
+   * 采集拼图。
+   *
+   * 与日常任务同样的坑：该页面会二次渲染，读到空列表可能是撞上了重渲染，
+   * 而不是真的没有拼图（实测同一时刻页面上有 4 个拼图链接，采集却返回 0）。
+   * 因此「读到空就再等再读」，最多重试若干次。
+   */
+  let quests = null;
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    quests = await page.evaluate(new Function(`
+      ${TEXT_HELPER}
     const box = document.querySelector('#quests');
     if (!box) return [];
 
@@ -498,6 +564,11 @@ export async function fetchQuests(page) {
     return out.filter((q) => (seen.has(q.href) ? false : (seen.add(q.href), true)));
   `));
 
+    if (Array.isArray(quests) && quests.length) return quests;
+    // 读到空 -> 很可能是二次渲染中，等一会儿再读
+    await page.waitForTimeout(2500);
+  }
+
   return quests || [];
 }
 
@@ -515,10 +586,20 @@ export async function fetchQuests(page) {
  */
 export async function fetchDailyTasks(page) {
   await safeGoto(page, EARN, { timeout: 60000 });
-  await page.waitForTimeout(7000);
 
-  const data = await page.evaluate(new Function(`
-    ${TEXT_HELPER}
+  /*
+   * 采集「日常任务」区块。
+   *
+   * 为什么要在循环里重试：实测该页面会**二次渲染** ——
+   * 先出现空的 `#moreactivities`（只有「日常任务」4 个字），
+   * 过一会儿才填充任务卡；而且外部等待通过后，读取瞬间仍可能撞上重渲染，
+   * 拿到的就是空列表。这正是「有时只完成一部分」的来源之一。
+   * 因此这里改为「读到空就再等再读」，最多重试若干次。
+   */
+  let data = null;
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    data = await page.evaluate(new Function(`
+      ${TEXT_HELPER}
     const box = document.querySelector('#moreactivities');
     if (!box) return { found: false, tasks: [], counter: null };
 
@@ -529,22 +610,37 @@ export async function fetchDailyTasks(page) {
     const tasks = [];
     for (const a of box.querySelectorAll('a[href]')) {
       const href = a.href || '';
-      if (!href || seen.has(href)) continue;
-      seen.add(href);
+      if (!href) continue;
 
-      // 卡片容器：向上找到含标题的最小块
+      /*
+       * 卡片边界：**逐级上溯直到出现「别的」任务链接为止**。
+       *
+       * 早期用的是「文本够长就停」，这会把卡片撑成整行，
+       * 于是相邻任务的「已完成」被算进本卡，导致**未完成的任务被误判为已完成而跳过**
+       * （实测：素食汉堡 / 化石精选 显示 +15 未做，却因同行邻居的「已完成」被判 done）。
+       */
       let card = a;
-      let t = txt(a);
-      for (let i = 0; i < 3 && t.length < 20 && card.parentElement; i++) {
-        card = card.parentElement;
-        t = txt(card);
+      for (let i = 0; i < 8 && card.parentElement; i++) {
+        const up = card.parentElement;
+        const others = [...up.querySelectorAll('a[href]')].filter((x) => x.href !== href);
+        // 出现了别的任务链接 -> 上一层已是列表容器，card 即本卡边界
+        if (others.length > 0) break;
+        card = up;
       }
 
-      // 标题：链接内的首个短文本，否则用整段开头
-      let title = txt(a.querySelector('p, span, h3, h4'));
-      if (!title) title = t.slice(0, 40);
+      const cardText = txt(card) || txt(a);
 
-      const cardText = txt(card) || t;
+      /*
+       * 去重键不能只用 href：实测「完成此拼图」与「周中拼图」共用同一个
+       * spotlight/imagepuzzle 链接，按 href 去重会直接丢掉一个任务。
+       * 改为「href + 标题」联合键，仅对同一张卡的重复渲染去重。
+       */
+      let title = txt(a.querySelector('p, span, h3, h4'));
+      if (!title) title = cardText.slice(0, 40);
+      const dedupKey = href + '||' + title;
+      if (seen.has(dedupKey)) continue;
+      seen.add(dedupKey);
+
       // 邀请好友类无法自动完成
       const isReferral = /referandearn|邀请好友|将推荐转化为奖励|分享邀请/i.test(href) || /真正的朋友|邀请好友/.test(title);
 
@@ -560,14 +656,23 @@ export async function fetchDailyTasks(page) {
         title: String(title).slice(0, 60),
         text: cardText.slice(0, 180),
         points: (() => { const m = cardText.match(/\\+\\s*([\\d,]+)/); return m ? Number(m[1].replace(/,/g, '')) : null; })(),
+        // 「已完成」只在本卡范围内查找，避免被邻居污染
         done: /已完成/.test(cardText),
+        cardText: cardText.slice(0, 120),
         kind,
       });
     }
     return { found: true, counter: cm ? cm[1] + '/' + cm[2] : null, tasks };
   `));
 
-  return data;
+    // 读到了任务卡 -> 完成；读到空 -> 说明撞上二次渲染，等一会儿再读
+    if (data && data.found && ((data.tasks && data.tasks.length > 0) || data.counter)) {
+      return data;
+    }
+    await page.waitForTimeout(2500);
+  }
+
+  return data || { found: false, tasks: [], counter: null };
 }
 
 /**
@@ -619,16 +724,33 @@ export async function inspectQuest(page, questUrl) {
 
       const heading = txt(h);
 
-      // 卡片内的行动入口：站外链接 + 非导航文案 + 非页脚 URL
-      // （「必应」这个 bing.com/?rwgbopen=1 导航项靠 NAV_RE 排除）
+      /*
+       * 卡片内的行动入口。
+       *
+       * 关键：「激活任务」这个 CTA 的 href 指向 **rewards.bing.com/dashboard**（站内），
+       * 早期为了挡掉全站导航而排除了所有 rewards.bing.com 链接，
+       * 结果把唯一能激活拼图的按钮也排除了 —— 未激活的拼图永远停在 0/N。
+       * 现在改为：站内链接只放行「激活/开启任务」这类明确动作。
+       *
+       * 注意：本段处于 new Function 的模板字符串中，正则里的反斜杠必须写成 \\\\。
+       */
+      const ACT_RE = /激活任务|开启任务|立即激活|启用任务|Activate/i;
       const links = [...card.querySelectorAll('a[href]')]
         .map((a) => ({ text: txt(a).slice(0, 30), href: a.href }))
         .filter((l) => {
           if (!l.text || NAV_RE.test(l.text)) return false;
-          if (/rewards\\.bing\\.com\\//i.test(l.href)) return false;
           if (FOOTER_URL_RE.test(l.href)) return false;
+          // 站内链接：仅放行激活类动作，其余（导航/页脚）一律排除
+          if (/rewards\\.bing\\.com\\//i.test(l.href)) return ACT_RE.test(l.text);
           return /bing\\.com|microsoft\\.com/i.test(l.href);
         });
+
+      // 有些子活动的动作是 <button>（无 href），也要纳入
+      const buttons = [...card.querySelectorAll('button')]
+        .map((b) => ({ text: txt(b).slice(0, 30), href: null, isButton: true, disabled: b.hasAttribute('disabled') }))
+        .filter((b) => b.text && !NAV_RE.test(b.text) && !b.disabled && /激活|开启|开始|参与|领取|试试|浏览|查看|下载/.test(b.text));
+
+      links.push(...buttons);
 
       const waiting = /等待\\s*24\\s*小时|完成后等待|天后等待|第二天/i.test(t);
       const doneMark = /已完成|已打卡/.test(t);

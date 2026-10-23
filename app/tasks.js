@@ -67,11 +67,51 @@ export async function doDailyTasks(page, cfg) {
       await safeGoto(page, EARN, { timeout: 60000 });
       await sleep(rand(2000, 3500));
 
-      const handle = await page.evaluateHandle((href) => {
-        return [...document.querySelectorAll('#moreactivities a[href]')].find((a) => a.href === href) || null;
-      }, task.href);
-      const el = handle.asElement();
-      if (!el) {
+      /*
+       * 定位目标卡片必须与采集侧使用**同一套标识**（href + 标题）。
+       *
+       * 实测：Rewards 会让两个不同任务共用同一个链接
+       *   「您听说过这句箴言吗？」与「每日箴言」 → 同一个 Quote of the day
+       *   「完成此拼图」与「周中拼图」       → 同一个 spotlight/imagepuzzle
+       * 若只按 href 用 find() 定位，永远只会命中 DOM 里的第一张，
+       * 另一个任务就会被反复"点空气"，永远无法完成。
+       */
+      const handle = await page.evaluateHandle((t) => {
+        const txt = (el) => (el ? (el.innerText || '').replace(/\s+/g, ' ').trim() : '');
+        const box = document.querySelector('#moreactivities');
+        if (!box) return null;
+
+        // 与 fetchDailyTasks() 保持一致的卡片边界算法
+        const cardOf = (a) => {
+          let card = a;
+          for (let k = 0; k < 8 && card.parentElement; k++) {
+            const up = card.parentElement;
+            if ([...up.querySelectorAll('a[href]')].filter((x) => x.href !== a.href).length > 0) break;
+            card = up;
+          }
+          return card;
+        };
+        const titleOf = (a) => {
+          const own = txt(a.querySelector('p, span, h3, h4'));
+          if (own) return own;
+          return (txt(cardOf(a)) || txt(a)).slice(0, 40);
+        };
+
+        const anchors = [...box.querySelectorAll('a[href]')];
+        // 1) 优先：href 相同且标题完全相同
+        let hit = anchors.find((a) => a.href === t.href && titleOf(a) === t.title);
+        if (hit) return hit;
+        // 2) 其次：href 相同且标题是前缀关系
+        hit = anchors.find((a) => a.href === t.href && (
+          titleOf(a).startsWith(t.title) || t.title.startsWith(titleOf(a))
+        ));
+        if (hit) return hit;
+        // 3) 兜底：标题唯一匹配（防 href 因参数变化而不同）
+        const byTitle = anchors.filter((a) => titleOf(a) === t.title);
+        if (byTitle.length === 1) return byTitle[0];
+        return null;
+      }, { href: task.href, title: task.title });
+      const el = handle.asElement();      if (!el) {
         log.info('    该卡片已不在页面上（可能已完成），跳过。');
         continue;
       }
@@ -107,8 +147,29 @@ export async function doDailyTasks(page, cfg) {
     result.counterAfter = after.counter;
     const stillPending = (after.tasks || []).filter((t) => !t.done && t.kind !== 'referral');
     result.remaining = stillPending.length;
+
+    /*
+     * 复核时仍未完成的任务分两种，不能一律丢进「待人工」：
+     *   A. 本次**点过**它，但没生效  -> 可能是入账延迟或该任务确实需要别的方式
+     *   B. 本次**根本没轮到**它（例如共用链接导致点错、被误判已完成而跳过）
+     * 只有 A 才适合提示用户；B 属于工具自身问题，应明确标为「未处理」而不是让用户以为要手动做。
+     */
+    const attemptedTitles = new Set((result.items || []).map((i) => i.title));
     for (const t of stillPending) {
-      result.skipped.push({ title: t.title, points: t.points, href: t.href, reason: '本次点击后仍未完成' });
+      const wasAttempted = attemptedTitles.has(t.title);
+      result.skipped.push({
+        title: t.title,
+        points: t.points,
+        href: t.href,
+        reason: wasAttempted ? '已点击但未生效（可能入账延迟）' : '本次未处理（检测到该任务但未执行）',
+        attempted: wasAttempted,
+      });
+    }
+    if (stillPending.length) {
+      const missed = stillPending.filter((t) => !attemptedTitles.has(t.title)).length;
+      if (missed) {
+        log.warn(`复核：仍有 ${missed} 项未完成且本次未执行（非需人工任务，属工具未覆盖）。`);
+      }
     }
     if (after.counter && after.counter !== data.counter) {
       log.success(`日常任务计数推进：${data.counter} → ${after.counter}`);
@@ -189,16 +250,45 @@ export async function doQuests(page, cfg) {
 
     for (const cta of info.ctas) {
       result.attempted += 1;
-      log.step(`  执行 CTA「${cta.text}」 -> ${cta.href.slice(0, 70)}`);
+      const ctaDesc = cta.href ? cta.href.slice(0, 70) : `（按钮）${cta.text}`;
+      log.step(`  执行 CTA「${cta.text}」 -> ${ctaDesc}`);
       try {
         // 每次点击前回到拼图页，保证元素是最新渲染状态
-        await page.goto(q.href, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await safeGoto(page, q.href, { timeout: 60000 });
         await sleep(rand(2500, 4000));
 
-        const handle = await page.evaluateHandle((href) => {
-          const links = [...document.querySelectorAll('a[href]')];
-          return links.find((a) => a.href === href) || null;
-        }, cta.href);
+        /*
+         * 定位方式：
+         *   有 href 的按 href 精确匹配；
+         *   无 href 的（<button> 类，如「试试吧」「下载壁纸」）按文本匹配。
+         */
+        const handle = await page.evaluateHandle((t) => {
+          const txt = (el) => (el ? (el.innerText || '').replace(/\s+/g, ' ').trim() : '');
+          const all = [...document.querySelectorAll('a[href], button')];
+
+          /*
+           * 定位顺序：href + 文本双重要求 -> 纯 href -> 纯文本。
+           *
+           * 只按 href 找会有隐患：同一个链接可能被多个 CTA 复用
+           * （拼图里多个子活动指向同一个搜索/拼图地址），
+           * find() 永远命中第一个，导致点错目标。
+           */
+          if (t.href) {
+            const sameHref = all.filter((e) => e.href === t.href);
+            // ① href 一致 + 文本匹配（最可靠）
+            const exact = sameHref.find((e) => txt(e) === t.text || txt(e).startsWith(t.text));
+            if (exact) return exact;
+            // ② href 一致且只有一个 -> 可以直接用
+            if (sameHref.length === 1 && !t.text) return sameHref[0];
+          }
+          // ③ 纯文本匹配（取最短匹配，避免命中整块容器）
+          const cands = all.filter((e) => {
+            const s = txt(e);
+            return s === t.text || (t.text && s.startsWith(t.text));
+          });
+          cands.sort((a, b) => txt(a).length - txt(b).length);
+          return cands[0] || null;
+        }, { href: cta.href, text: cta.text });
         const el = handle.asElement();
         if (!el) {
           log.info('    该 CTA 已不在页面上（可能已处理），跳过。');
@@ -254,7 +344,7 @@ export async function doQuests(page, cfg) {
 export async function visitTask(page, task) {
   const item = { title: task.title, points: task.points ?? null, ok: false, note: '' };
   try {
-    await page.goto(task.href, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await safeGoto(page, task.href, { timeout: 45000 });
     await sleep(rand(2500, 4500));
 
     // 有些任务需要一个「领取/开始」之类的点击（排除无障碍跳转与导航项）
@@ -431,7 +521,7 @@ export async function doAllDashboardTasks(page, cfg) {
 
       if (!done) {
         try {
-          await page.goto(task.href, { waitUntil: 'domcontentloaded', timeout: 45000 });
+          await safeGoto(page, task.href, { timeout: 45000 });
           await sleep(rand(2500, 4500));
           await page.mouse.wheel(0, rand(300, 800)).catch(() => {});
           await sleep(rand(1200, 2200));
@@ -497,7 +587,7 @@ export async function doQuizzes(page) {
     for (const q of quizzes.slice(0, 5)) {
       result.attempted += 1;
       log.step(`尝试完成测验：${q.title || q.href.slice(0, 50)}`);
-      await page.goto(q.href, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      await safeGoto(page, q.href, { timeout: 45000 }).catch(() => {});
       await sleep(rand(2500, 4500));
       // 依次点击问答选项
       for (let i = 0; i < 4; i++) {
@@ -594,23 +684,95 @@ export async function claimPoints(page) {
     });
     await page.waitForTimeout(2500);
 
-    // 点击面板中的「领取积分」
-    const clicked = await page.evaluate(() => {
-      const txt = (el) => (el ? (el.innerText || '').replace(/\s+/g, ' ').trim() : '');
-      const cands = [...document.querySelectorAll('button, a')]
-        .filter((b) => /领取积分|立即领取|领取$/.test(txt(b)) && !/可领取/.test(txt(b)));
-      if (!cands.length) return null;
-      cands[0].click();
-      return txt(cands[0]);
-    });
+    /*
+     * 领取面板里可能同时有**多个**待领取项（实测 acc-2 就有两个：
+     * 「积分上限 900 积分 必应 Star 奖励」与「90 积分 默认搜索奖励」）。
+     * 早期只点 cands[0]，第二个永远领不到。
+     *
+     * 注意：点击后条目的文案不一定立刻变成「已领取」（有的会直接消失、
+     * 有的要等积分入账），所以**不能只靠文案判断**，
+     * 否则会对同一条目反复点击直到次数用尽。
+     * 这里改为「记录已点击过的条目文案，且检测条目集合是否缩小」，
+     * 一旦连续两次没有进展就立即停止。
+     */
+    const claimedItems = [];
+    const clickedLabels = new Set();
+    let noProgress = 0;
+    const MAX_CLAIM_ROUNDS = 8;
 
-    if (!clicked) {
+    /** 读取当前面板里「待领取」条目的文案列表 */
+    const readPendingLabels = () => page.evaluate(() => {
+      const txt = (el) => (el ? (el.innerText || '').replace(/\s+/g, ' ').trim() : '');
+      return [...document.querySelectorAll('button, a')]
+        .map((b) => txt(b))
+        .filter((t) => /待领取/.test(t) && !/可领取/.test(t))
+        .map((t) => t.slice(0, 80));
+    }).catch(() => []);
+
+    for (let round = 0; round < MAX_CLAIM_ROUNDS; round++) {
+      const pendingBefore = await readPendingLabels();
+      if (!pendingBefore.length) break;   // 没有待领取项了
+
+      const clicked = await page.evaluate((seen) => {
+        const txt = (el) => (el ? (el.innerText || '').replace(/\s+/g, ' ').trim() : '');
+        const cands = [...document.querySelectorAll('button, a')]
+          .map((b) => ({ b, t: txt(b) }))
+          .filter(({ b, t }) => {
+            if (/可领取/.test(t)) return false;                     // 外层入口卡片
+            if (!/待领取|领取积分|立即领取/.test(t)) return false;
+            if (b.hasAttribute('disabled')) return false;
+            if (seen.includes(t.slice(0, 80))) return false;        // 已点过的不再点
+            return true;
+          });
+        // 优先带「待领取」的具体条目
+        const pick = cands.find(({ t }) => /待领取/.test(t)) || cands[0];
+        if (!pick) return null;
+        pick.b.click();
+        return pick.t.slice(0, 80);
+      }, [...clickedLabels]);
+
+      if (!clicked) break;   // 剩下的都点过了
+
+      clickedLabels.add(clicked);
+      claimedItems.push(clicked);
+      log.step(`点击领取（第 ${round + 1} 项）：「${clicked}」`);
+      await page.waitForTimeout(rand(3500, 5000));
+
+      /*
+       * 判断是否真有进展：待领取条目数减少，或者出现了成功提示。
+       * 连续 2 次没进展就停止，避免无意义的重复点击。
+       */
+      const pendingAfter = await readPendingLabels();
+      const progressed = pendingAfter.length < pendingBefore.length;
+      if (!progressed) {
+        noProgress += 1;
+        if (noProgress >= 2) {
+          log.info('    领取面板没有进一步变化，停止继续点击。');
+          break;
+        }
+      } else {
+        noProgress = 0;
+      }
+
+      // 面板关闭了就重新打开，以便继续领下一项
+      if (!pendingAfter.length) {
+        const reopened = await page.evaluate(() => {
+          const txt = (el) => (el ? (el.innerText || '').replace(/\s+/g, ' ').trim() : '');
+          const card = [...document.querySelectorAll('button')].find((b) => /可领取/.test(txt(b)) && /领取/.test(txt(b)));
+          if (!card) return false;
+          card.click();
+          return true;
+        });
+        if (!reopened) break;    // 入口卡片消失 = 全部领完
+        await page.waitForTimeout(2500);
+      }
+    }
+
+    if (!claimedItems.length) {
       result.message = '未找到「领取积分」按钮。';
       log.warn(result.message);
       return result;
     }
-    log.step(`点击：「${clicked}」`);
-    await page.waitForTimeout(4500);
 
     // 校验一：页面是否提示领取成功
     const successHint = await page.evaluate(() => /已成功领取|领取成功/.test(document.body.innerText || '')).catch(() => false);
@@ -626,11 +788,13 @@ export async function claimPoints(page) {
       return [...document.querySelectorAll('button')].some((b) => /可领取/.test(txt(b)) && /领取/.test(txt(b)));
     }).catch(() => true);
 
+    result.claimedItems = claimedItems;
     result.claimed = successHint || (gained != null && gained > 0) || !stillThere;
     if (result.claimed) {
+      const n = claimedItems.length;
       result.message = gained > 0
-        ? `已领取积分 +${gained}（当前 ${result.pointsAfter}）`
-        : `已领取 ${claimCard.amount ?? ''} 积分`;
+        ? `已领取 ${n} 项积分 +${gained}（当前 ${result.pointsAfter}）`
+        : `已领取 ${n} 项（${claimCard.amount ?? ''} 积分）`;
       log.success(result.message);
     } else {
       result.message = '已点击领取，但未检测到积分变化，可能稍后到账。';

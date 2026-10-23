@@ -6,7 +6,10 @@ import {
   loadConfig, resolveAccountConfig, getAccount, saveAccountOverrides, setCurrentAccount,
 } from './config.js';
 import { launchBrowser, closeBrowser, getPage, readAccountName, screenshot } from './browser.js';
-import { inspect, analyzeQuota, bingPoints, homeValueMismatch, DASHBOARD } from './rewards.js';
+import {
+  inspect, analyzeQuota, bingPoints, homeValueMismatch, DASHBOARD,
+  bingHeaderIdentity, evaluateSessionMatch, dashboardAccountName,
+} from './rewards.js';
 import { runSearches } from './search.js';
 import { doAllDashboardTasks, doDailyTasks, doQuests, doQuizzes, claimPoints, visitEarn, checkMobileApp } from './tasks.js';
 import { loadState, saveState, rollDay, addHistory, todayKey } from './store.js';
@@ -131,14 +134,18 @@ export async function runOnce(opts = {}) {
 
     // Rewards 与必应会话是否一致（页头停在别的账号 -> 搜索会算到别人头上）
     const headerNow = await bingPoints(page);
-    if (homeValueMismatch(headerNow, loginInfo.rawPoints)) {
+    const headerName = await bingHeaderIdentity(page);
+    const dashName = await dashboardAccountName(page).catch(() => null);
+    const matchR = evaluateSessionMatch({
+      headerPoints: headerNow, headerName, dashPoints: loginInfo.rawPoints, dashName,
+    });
+    if (matchR.mismatch) {
       record.sessionMismatch = true;
-      log.warn(
-        `${prefix} ⚠ 必应会话与 Rewards 账号不一致：`
-        + `必应页头 ${headerNow} 分，本账号实际 ${loginInfo.rawPoints} 分。`
-      );
-      log.warn(`${prefix}   这通常表示该配置目录里的必应会话还停留在另一个账号上。`);
-      log.warn(`${prefix}   本次将只按 Rewards 数据判断额度；建议对该账号重新登录一次并确认必应页头显示本账号。`);
+      record.sessionMismatchReason = matchR.reason;
+      log.warn(`${prefix} ⚠ 必应会话与 Rewards 账号不一致：${matchR.reason}`);
+      log.warn(`${prefix}   该配置目录里的必应会话还停留在另一个账号上（实测常见于同时登录多个号）。`);
+      log.warn(`${prefix}   本次将只按 Rewards 数据判断额度，不会影响本账号实际得分。`);
+      log.warn(`${prefix}   要彻底修复：对本账号点「重置登录」，再重新登录一次（只需一次）。`);
     }
 
     // 未标注时读取账号显示名（Rewards 页面上的名字）
@@ -237,6 +244,15 @@ export async function runOnce(opts = {}) {
         log.step(`${prefix} 执行日常任务（积分赚取页的日常任务区）…`);
         record.dailyTasks = await doDailyTasks(page, cfg);
         for (const t of record.dailyTasks.skipped || []) {
+          /*
+           * 「本次未处理」属于工具未覆盖，不是用户该手动做的事，
+           * 单列到 unfinished 里如实说明，避免误导成「待人工」。
+           */
+          if (t.attempted === false) {
+            record.unfinishedTasks = record.unfinishedTasks || [];
+            record.unfinishedTasks.push({ title: t.title, points: t.points, href: t.href, reason: t.reason });
+            continue;
+          }
           record.manualTasks = record.manualTasks || [];
           record.manualTasks.push({ title: t.title, points: t.points, href: t.href });
         }

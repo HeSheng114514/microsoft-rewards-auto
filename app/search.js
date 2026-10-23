@@ -3,8 +3,11 @@
  */
 import { log } from './logger.js';
 import { generateQueries } from './queries.js';
-import { bingPoints, dashboardPoints, homeValueMismatch } from './rewards.js';
-import { NetworkGuard } from './net.js';
+import {
+  bingPoints, dashboardPoints, homeValueMismatch,
+  bingHeaderIdentity, evaluateSessionMatch, dashboardAccountName,
+} from './rewards.js';
+import { NetworkGuard, safeGoto } from './net.js';
 
 const HOME = 'https://cn.bing.com/';
 
@@ -62,7 +65,7 @@ async function humanScroll(page, times = 2) {
 /** 从必应首页热榜读取几条真实热点，作为更自然的搜索词 */
 export async function readHeadlines(page, limit = 6) {
   try {
-    await page.goto(HOME, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await safeGoto(page, HOME, { timeout: 45000 });
     await page.waitForTimeout(rand(1500, 3000));
     const items = await page.evaluate((n) => {
       const picks = [...document.querySelectorAll('#sp_requery a, .hilite_prop, #rich_news a, a[href*="/search?q="]')]
@@ -82,7 +85,7 @@ export async function readHeadlines(page, limit = 6) {
  * 设置搜索框内容并提交
  */
 async function performSearch(page, query) {
-  await page.goto(HOME, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await safeGoto(page, HOME, { timeout: 45000 });
   await page.waitForSelector('#sb_form_q', { timeout: 20000 });
   await sleep(rand(600, 1800));
   await humanType(page, '#sb_form_q', query);
@@ -132,23 +135,32 @@ export async function runSearches(page, cfg, opts = {}) {
 
   // ---- 起始积分：以 Rewards 仪表盘为账号权威值 ----
   const dashBefore = await dashboardPoints(page);
-  await page.goto(HOME, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+  const dashName = await dashboardAccountName(page).catch(() => null);
+  await safeGoto(page, HOME, { timeout: 45000 }).catch(() => {});
   await page.waitForTimeout(2500);
   const headerBefore = await bingPoints(page);
+  const headerName = await bingHeaderIdentity(page);
 
-  // 页头会话与账号不一致时，页头数值完全不可用（会按别的账号判断额度）
-  const mismatched = homeValueMismatch(headerBefore, dashBefore);
+  /*
+   * 页头会话与账号不一致时，页头数值完全不可用（会按别的账号判断额度）。
+   * 优先用昵称判定：实测「本账号 个给/2234，页头却显示 生/5489」时，
+   * 单看积分可能恰好接近而漏判，比昵称最可靠。
+   */
+  const matchResult = evaluateSessionMatch({
+    headerPoints: headerBefore, headerName, dashPoints: dashBefore, dashName,
+  });
+  const mismatched = matchResult.mismatch;
   if (mismatched) {
-    log.warn(
-      `⚠ 必应页头显示的积分（${headerBefore}）与本账号实际积分（${dashBefore}）不一致：`
-      + '说明该浏览器配置里的必应会话仍停留在另一个账号上。已自动改用 Rewards 数据判断额度。'
-    );
-    log.warn('  建议：在控制台对本账号重新点一次「登录」，并用本账号的必应主页完成登录，以消除该错配。');
+    log.warn(`⚠ 必应页头与本账号不一致：${matchResult.reason}`);
+    log.warn('  该浏览器配置里的必应会话停在了另一个账号上，已自动改用 Rewards 数据判断额度。');
+    log.warn('  建议：在控制台对该账号点「重置登录」，再重新登录一次本账号。');
   }
 
   summary.pointsBefore = dashBefore ?? headerBefore;
   summary.headerBefore = headerBefore;
+  summary.headerName = headerName;
   summary.sessionMismatch = mismatched;
+  summary.sessionMismatchReason = matchResult.reason || null;
 
   /**
    * 页头是否已不可信（运行期可变）。
